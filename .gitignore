@@ -29,6 +29,7 @@ Desktop.ini
 
 # Data / outputs
 data/
+checkpoints/
 *.npy
 *.npz
 *.pkl

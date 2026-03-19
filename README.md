@@ -48,11 +48,7 @@
 - **Critical:** Never assign 0.0 probability — use floor of 0.01, then renormalize
 - Round score = average of 5 seed scores; leaderboard = best round ever
 
-### Initial Data Available
-
-- Map seed → full initial terrain grid (reconstructable locally)
-- Settlement positions + port status (no internal stats like population/food)
-- Map dimensions (W×H)
+---
 
 ## Setup
 
@@ -65,103 +61,212 @@
 ### Install dependencies
 
 ```bash
-# Baseline only (no GPU needed)
+# Baseline / uniform (no GPU needed)
 pip install requests numpy
 
-# CNN script (also needs PyTorch)
+# CNN training (also needs PyTorch)
 pip install requests numpy torch
 ```
 
-> **PyTorch note:** If `import torch` fails with a DLL error on Windows, install the correct build for your system from [pytorch.org/get-started](https://pytorch.org/get-started/locally/). For CPU-only:
+> **PyTorch note:** If `import torch` fails with a DLL error on Windows, install the correct build from [pytorch.org/get-started](https://pytorch.org/get-started/locally/). For CPU-only:
 > ```bash
 > pip install torch --index-url https://download.pytorch.org/whl/cpu
 > ```
 
-### Set your JWT token
+### Configure your JWT token
 
 1. Log in at [app.ainm.no](https://app.ainm.no)
-2. Open browser DevTools → Application → Cookies
-3. Copy the value of `access_token`
-4. Create your `.env` file:
+2. Open browser DevTools → Application → Cookies → copy `access_token`
+3. Create your `.env` file:
 
 ```bash
 cp .env.example .env
 ```
 
-5. Edit `.env` and paste your token:
+4. Edit `.env` and paste your token:
 
 ```
 ASTAR_TOKEN=your_jwt_token_here
 ```
 
-The scripts auto-load `.env` from the project directory — no need to export variables manually.
+All scripts auto-load `.env` from the project directory.
 
-## Scripts
+---
 
-There are 3 scripts, from simplest to most advanced:
+## Methods
 
-### 1. `astar_uniform.py` — Instant fallback (no queries used)
+The project contains **three live submission methods** and an **offline training + evaluation pipeline**.
+
+### Method 1 — Uniform Fallback (`astar_uniform.py`)
+
+The simplest possible submission: every cell gets a uniform 1/6 probability for each class.
+
+- **Queries used:** 0
+- **Expected score:** ~1–5 (low, but non-zero)
+- **Use case:** Verify auth works, get on the leaderboard instantly
 
 ```bash
 python astar_uniform.py
 ```
 
-Submits a uniform 1/6 distribution for every cell on every seed. Uses **zero queries**. Scores low (~1-5) but guarantees a non-zero score on the board in seconds. Use this to verify your token works and get on the leaderboard immediately.
+### Method 2 — Prior + Observation Blending (`astar_baseline.py`)
 
-### 2. `astar_baseline.py` — Prior + observation blending
+Uses terrain-based hand-tuned priors (e.g., ocean cells → 95% Empty) and refines them by spending the 50-query budget to observe actual simulation outcomes.
+
+- **Queries used:** up to 50
+- **Runtime:** ~1–2 min (1s sleep per query for rate limiting)
+- **Expected score:** moderate — better than uniform, limited by hand-tuned priors
 
 ```bash
 python astar_baseline.py
 ```
 
-Uses your **50 query budget** to observe simulation outcomes through viewports. Builds predictions by blending terrain-based priors with observed data. Takes ~1-2 minutes (1s per query). Scores better than uniform.
+### Method 3 — CNN with Fallback (`astar_cnn.py`)
 
-### 3. `astar_cnn.py` — CNN-based prediction (recommended)
+Full pipeline that guarantees a submission even if the CNN fails:
+
+1. Fetches round info from API
+2. **Immediately submits prior-based fallback** (same quality as Method 2, without using queries)
+3. Spends query budget collecting observations → saves to `data/`
+4. Trains a small CNN (14→32→32→6 channels) on the collected data
+5. Resubmits CNN predictions (overwrites fallback — only the last submission counts)
+
+If PyTorch is not installed, or the CNN crashes for any reason, the fallback from step 2 still stands.
+
+- **Queries used:** up to 50
+- **Runtime:** 2–10 min depending on training
+- **Fallback:** always — PyTorch errors are caught gracefully
 
 ```bash
 python astar_cnn.py
 ```
 
-The full pipeline:
-1. **Immediately submits prior-based fallback** — you have a score even if the CNN is slow
-2. **Collects observations** using the query budget (same as baseline)
-3. **Saves observations to `data/`** for offline retraining later
-4. **Trains a small CNN** mapping initial terrain features → final terrain probabilities
-5. **Resubmits CNN predictions** (overwrites the fallback — only last submission counts)
+**Time limit** (default 120 min, configurable):
 
-Has a built-in **time limit** (default: 120 minutes). If CNN training runs out of time, the fallback submission stands. Set a custom limit in `.env`:
-
-```
+```bash
+# In .env
 ASTAR_TIME_LIMIT=90
+
+# Or inline (PowerShell)
+$env:ASTAR_TIME_LIMIT="90"; python astar_cnn.py
 ```
 
-Or via environment variable:
+### Method 4 — Offline CNN Training (`train_cnn.py` + `eval_cnn.py`)
+
+Train the CNN **offline** using ground truth data from completed rounds — no query budget consumed, no time pressure.
+
+#### Step 1: Train
 
 ```bash
-# Windows (PowerShell)
-$env:ASTAR_TIME_LIMIT = "90"   # minutes
-python astar_cnn.py
-
-# Windows (CMD)
-set ASTAR_TIME_LIMIT=90
-python astar_cnn.py
-
-# Linux/Mac
-ASTAR_TIME_LIMIT=90 python astar_cnn.py
+python train_cnn.py
 ```
 
-### Recommended first-run workflow
+What it does:
 
-1. Run `astar_uniform.py` first to verify auth and get on the board
-2. Run `astar_cnn.py` — it will submit a prior-based fallback immediately, then try to improve with the CNN
-3. Observation data is saved in `data/` for offline experiments
+1. Queries `GET /rounds` to find completed/scoring rounds
+2. Downloads ground truth via `GET /analysis/{round_id}/{seed_index}` for each seed
+3. **Caches everything in `data/ground_truth/`** — re-running skips the download
+4. Encodes initial grids into 14-channel feature tensors
+5. Splits each 40×40 map into 4 quadrants: **3 for training, 1 for validation** (bottom-right by default)
+6. Trains with **KL divergence loss** (same metric as competition scoring)
+7. Saves checkpoints every 25 epochs to `checkpoints/`
+8. Saves `checkpoints/cnn_latest.pt` at the end
 
-## Improving the Baseline
+**Resumable:** If interrupted (Ctrl+C), re-running picks up from the latest checkpoint automatically.
 
-Key areas to improve predictions:
+Training hyperparameters (via env vars or `.env`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `ASTAR_TRAIN_EPOCHS` | 300 | Total training epochs |
+| `ASTAR_TRAIN_LR` | 0.001 | Learning rate |
+| `ASTAR_TRAIN_BATCH` | 64 | Batch size (number of maps per batch) |
+| `ASTAR_CKPT_EVERY` | 25 | Checkpoint frequency (epochs) |
+| `ASTAR_VAL_QUADRANT` | 3 | Validation quadrant (0=TL, 1=TR, 2=BL, 3=BR) |
+
+Example with custom settings:
+
+```bash
+# PowerShell
+$env:ASTAR_TRAIN_EPOCHS="500"; $env:ASTAR_TRAIN_LR="5e-4"; python train_cnn.py
+```
+
+#### Step 2: Evaluate
+
+```bash
+python eval_cnn.py                                   # evaluates cnn_latest.pt
+python eval_cnn.py checkpoints/cnn_epoch_0100.pt     # specific checkpoint
+```
+
+Compares the CNN checkpoint against two baselines on the validation quadrant:
+
+- **CNN** — trained model predictions
+- **Prior** — hand-tuned priors (same as Method 2)
+- **Uniform** — 1/6 everywhere
+
+Output includes:
+
+- Per-seed simulated competition score (`100 × exp(-3 × wKL)`)
+- Per-seed validation KL divergence
+- Averages across all seeds
+- Per-class KL breakdown (which terrain types the CNN struggles with)
+
+---
+
+## Recommended Workflow
+
+### First time (get on the board fast)
+
+```bash
+python astar_uniform.py       # instant score, zero queries
+python astar_cnn.py           # burns queries, submits fallback + CNN
+```
+
+### After a round completes (improve for next round)
+
+```bash
+python train_cnn.py           # download ground truth, train offline
+python eval_cnn.py            # check how well the CNN does
+# Tweak hyperparameters, retrain, repeat
+```
+
+### During an active round (submit the best you have)
+
+```bash
+# Quick fallback-only submission (no queries burned)
+$env:ASTAR_TIME_LIMIT="0.1"; python astar_cnn.py
+
+# Full pipeline
+python astar_cnn.py
+```
+
+---
+
+## Project Structure
+
+```
+Astar-Island-Oracle/
+├── .env.example          # Token + config template
+├── .env                  # Your actual config (git-ignored)
+├── .gitignore
+├── README.md
+├── astar_uniform.py      # Method 1: uniform 1/6 submission
+├── astar_baseline.py     # Method 2: prior + observation blending
+├── astar_cnn.py          # Method 3: CNN with auto-fallback
+├── train_cnn.py          # Method 4: offline training from ground truth
+├── eval_cnn.py           # Evaluate a trained checkpoint
+├── data/                 # Cached observations & ground truth (git-ignored)
+│   └── ground_truth/     # Downloaded analysis data per round/seed
+└── checkpoints/          # Saved model checkpoints (git-ignored)
+```
+
+---
+
+## Improving Further
 
 - **Smarter query allocation** — focus viewports on dynamic areas (near settlements), not static ocean/mountain
-- **Multi-observation averaging** — query the same viewport multiple times per seed for better statistics
+- **Multi-observation averaging** — query the same viewport multiple times per seed
 - **Simulation modeling** — implement growth/conflict/trade/winter mechanics to forecast outcomes
-- **Cross-seed learning** — all 5 seeds share the same hidden parameters; insights from one seed apply to others
-- **Neighborhood features** — settlement survival depends on adjacent terrain (food from forests, coastal ports)
+- **Cross-seed learning** — all 5 seeds share hidden parameters; insights transfer
+- **Larger model** — deeper CNN, attention layers, or graph-based approaches
+- **Accumulate training data** — every completed round adds more ground truth for offline training
