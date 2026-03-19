@@ -470,13 +470,12 @@ def _clear_checkpoints():
 # ---------------------------------------------------------------------------
 
 def train(all_data, reset=False, forever=False):
-    val_q = VAL_QUADRANT
     print(f"\n{'='*60}")
-    print(f"  Building datasets (val quadrant = {val_q})")
+    print(f"  Building datasets (4-fold quadrant cross-validation)")
     print(f"{'='*60}")
 
-    features_list, targets_list, train_masks, val_masks, meta = \
-        build_fullmap_datasets(all_data, val_quadrant=val_q)
+    features_list, targets_list, _, _, meta = \
+        build_fullmap_datasets(all_data, val_quadrant=0)
 
     if not features_list:
         print("ERROR: No usable data found.")
@@ -485,12 +484,21 @@ def train(all_data, reset=False, forever=False):
     # Convert to tensors
     X = torch.tensor(np.stack(features_list)).to(DEVICE)       # (N, 14, H, W)
     Y = torch.tensor(np.stack(targets_list)).to(DEVICE)        # (N, 6, H, W)
-    T_mask = torch.tensor(np.stack(train_masks)).to(DEVICE)    # (N, H, W)
-    V_mask = torch.tensor(np.stack(val_masks)).to(DEVICE)      # (N, H, W)
 
     N, _, H, W = X.shape
+
+    # Pre-build (H, W) masks for all 4 folds
+    fold_masks = []  # list of (train_hw, val_hw) tuples
+    for q in range(4):
+        t_np, v_np = quadrant_masks(H, W, val_quadrant=q)
+        fold_masks.append((
+            torch.tensor(t_np, device=DEVICE),
+            torch.tensor(v_np, device=DEVICE),
+        ))
+
+    pix_per_q = (H // 2) * (W // 2) * N
     print(f"  Tensors: X={list(X.shape)}, Y={list(Y.shape)}")
-    print(f"  Train pixels: {int(T_mask.sum())}, Val pixels: {int(V_mask.sum())}")
+    print(f"  4-fold CV: {pix_per_q * 3} train / {pix_per_q} val pixels per fold")
 
     # Model & optimizer
     model = QuickCNN().to(DEVICE)
@@ -519,14 +527,14 @@ def train(all_data, reset=False, forever=False):
     print(f"  Checkpoint every {CHECKPOINT_EVERY} epochs")
     print()
 
-    # Dataset / DataLoader for map-level batching
-    dataset = TensorDataset(X, Y, T_mask, V_mask)
+    # Dataset / DataLoader for map-level batching (masks applied per-fold)
+    dataset = TensorDataset(X, Y)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     metadata = {
         "num_maps": N,
         "map_size": f"{H}x{W}",
-        "val_quadrant": val_q,
+        "cross_validation": "4-fold quadrant",
         "rounds": [m["round"] for m in meta],
         "lr": LR,
         "start_time": datetime.datetime.now().isoformat(),
@@ -556,26 +564,33 @@ def train(all_data, reset=False, forever=False):
     try:
         for epoch in _epoch_iter():
             last_epoch = epoch
-            # --- Train ---
             model.train()
             epoch_train_loss = 0.0
-            n_train_batches = 0
+            epoch_val_loss = 0.0
+            total_train_batches = 0
 
-            for X_b, Y_b, Tm_b, Vm_b in loader:
-                optimizer.zero_grad()
-                pred = model(X_b)  # (B, 6, H, W)
-                loss = kl_divergence_loss(pred, Y_b, mask=Tm_b)
-                loss.backward()
-                optimizer.step()
-                epoch_train_loss += loss.item()
-                n_train_batches += 1
+            # --- 4-fold cross-validation ---
+            for t_hw, v_hw in fold_masks:
+                # Train on 3 quadrants
+                for X_b, Y_b in loader:
+                    B = X_b.shape[0]
+                    Tm_b = t_hw.unsqueeze(0).expand(B, -1, -1)
+                    optimizer.zero_grad()
+                    pred = model(X_b)  # (B, 6, H, W)
+                    loss = kl_divergence_loss(pred, Y_b, mask=Tm_b)
+                    loss.backward()
+                    optimizer.step()
+                    epoch_train_loss += loss.item()
+                    total_train_batches += 1
 
-            avg_train = epoch_train_loss / max(n_train_batches, 1)
+                # Validate on held-out quadrant (dropout stays active)
+                with torch.no_grad():
+                    V_full = v_hw.unsqueeze(0).expand(N, -1, -1)
+                    pred_all = model(X)
+                    epoch_val_loss += kl_divergence_loss(pred_all, Y, mask=V_full).item()
 
-            # --- Validate (keep dropout active for fair comparison) ---
-            with torch.no_grad():
-                pred_all = model(X)  # full dataset forward pass
-                val_loss = kl_divergence_loss(pred_all, Y, mask=V_mask).item()
+            avg_train = epoch_train_loss / max(total_train_batches, 1)
+            val_loss = epoch_val_loss / 4
 
             if val_loss < best_val:
                 best_val = val_loss
