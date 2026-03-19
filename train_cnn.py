@@ -233,15 +233,17 @@ def encode_initial_grid(initial_grid, width, height):
 # ---------------------------------------------------------------------------
 
 class QuickCNN(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout=0.2):
         super().__init__()
         self.conv1 = nn.Conv2d(14, 32, kernel_size=3, padding=1)
+        self.drop1 = nn.Dropout2d(p=dropout)
         self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.drop2 = nn.Dropout2d(p=dropout)
         self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
+        x = self.drop1(F.relu(self.conv1(x)))
+        x = self.drop2(F.relu(self.conv2(x)))
         logits = self.out_conv(x)
         probs = F.softmax(logits, dim=1)
         probs = torch.clamp(probs, min=PROB_FLOOR)
@@ -570,8 +572,7 @@ def train(all_data, reset=False, forever=False):
 
             avg_train = epoch_train_loss / max(n_train_batches, 1)
 
-            # --- Validate ---
-            model.eval()
+            # --- Validate (keep dropout active for fair comparison) ---
             with torch.no_grad():
                 pred_all = model(X)  # full dataset forward pass
                 val_loss = kl_divergence_loss(pred_all, Y, mask=V_mask).item()

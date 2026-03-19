@@ -196,15 +196,17 @@ def encode_initial_grid(initial_grid, width, height):
 # --- CNN Model ---
 
 class QuickCNN(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout=0.2):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels=14, out_channels=32, kernel_size=3, padding=1)
+        self.drop1 = nn.Dropout2d(p=dropout)
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
+        self.drop2 = nn.Dropout2d(p=dropout)
         self.out_conv = nn.Conv2d(in_channels=32, out_channels=6, kernel_size=1)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
+        x = self.drop1(F.relu(self.conv1(x)))
+        x = self.drop2(F.relu(self.conv2(x)))
         logits = self.out_conv(x)
 
         # Convert logits to probabilities with safety floor
