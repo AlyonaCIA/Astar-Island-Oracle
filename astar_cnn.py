@@ -64,6 +64,8 @@ session.headers["Authorization"] = f"Bearer {TOKEN}"
 NUM_CLASSES = 6
 PROB_FLOOR = 0.01
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") if TORCH_AVAILABLE else None
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
 
 TERRAIN_CODES = [0, 1, 2, 3, 4, 5, 10, 11]  # 8 one-hot channels
 
@@ -89,6 +91,7 @@ def past_deadline():
 def get_active_round():
     resp = session.get(f"{BASE_URL}/rounds")
     resp.raise_for_status()
+    time.sleep(1.0)
     rounds = resp.json()
     active = next((r for r in rounds if r["status"] == "active"), None)
     if not active:
@@ -102,11 +105,13 @@ def get_active_round():
 def get_round_details(round_id):
     resp = session.get(f"{BASE_URL}/rounds/{round_id}")
     resp.raise_for_status()
+    time.sleep(1.0)
     return resp.json()
 
 
 def check_budget(verbose=True):
     resp = session.get(f"{BASE_URL}/budget")
+    time.sleep(1.0)
     if resp.status_code == 200:
         data = resp.json()
         if verbose:
@@ -125,6 +130,7 @@ def simulate(round_id, seed_index, vx, vy, vw=15, vh=15):
         "viewport_h": min(vh, 15),
     })
     resp.raise_for_status()
+    time.sleep(1.0)
     return resp.json()
 
 
@@ -135,6 +141,7 @@ def submit_prediction(round_id, seed_index, prediction):
         "prediction": prediction.tolist(),
     })
     resp.raise_for_status()
+    time.sleep(1.0)
     return resp.json()
 
 
@@ -271,8 +278,6 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
                 used = result.get("queries_used", "?")
                 max_q = result.get("queries_max", "?")
                 print(f"  Seed {seed_idx} query {i+1}: ({vp['x']},{vp['y']}) {vp['w']}x{vp['h']} — budget {used}/{max_q}")
-
-                time.sleep(1.0)
 
                 if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
                     print("  Budget exhausted!")
@@ -436,6 +441,36 @@ def train_model(X, y, epochs=80, lr=1e-3, batch_size=512):
     return model
 
 
+# --- Checkpoint loading ---
+
+def load_pretrained_checkpoint():
+    """Load the latest pretrained checkpoint from train_cnn.py, if available."""
+    latest = os.path.join(CHECKPOINT_DIR, "cnn_latest.pt")
+    if os.path.isfile(latest):
+        path = latest
+    else:
+        # Fall back to highest epoch checkpoint
+        if not os.path.isdir(CHECKPOINT_DIR):
+            return None
+        files = [f for f in os.listdir(CHECKPOINT_DIR)
+                 if f.startswith("cnn_epoch_") and f.endswith(".pt")]
+        if not files:
+            return None
+        files.sort(key=lambda f: int(f.replace("cnn_epoch_", "").replace(".pt", "")),
+                   reverse=True)
+        path = os.path.join(CHECKPOINT_DIR, files[0])
+
+    print(f"  Loading pretrained checkpoint: {os.path.basename(path)}")
+    model = QuickCNN().to(DEVICE)
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    epoch = ckpt.get("epoch", "?")
+    val_loss = ckpt.get("val_loss", "?")
+    print(f"  Checkpoint epoch={epoch}, val_loss={val_loss}")
+    return model
+
+
 # --- Prediction ---
 
 def predict_full_map(model, features, width, height):
@@ -571,38 +606,62 @@ def main():
 
     # --- CNN pipeline (any error here is non-fatal — fallback already submitted) ---
     try:
-        # Step 4: Collect observations
+        # Step 4: Always collect observations (saved to disk for future training)
         print(f"\n--- Collecting observations ({time_remaining():.0f}s remaining) ---")
         observations = collect_observations(
             round_id, seeds_count, initial_states, width, height
         )
 
-        if not observations or past_deadline():
-            print("\nNo observations or deadline reached. Fallback submission stands.")
-            return
-
-        # Step 5: Build training data and train CNN
-        print(f"\n--- Building training data ({time_remaining():.0f}s remaining) ---")
-        X, y, encoded_grids = build_training_data(
-            observations, initial_states, width, height
-        )
-
         if past_deadline():
-            print("\nDeadline reached before training. Fallback submission stands.")
+            print("\nDeadline reached after observations. Fallback submission stands.")
             return
 
-        print(f"\n--- Training CNN ({time_remaining():.0f}s remaining) ---")
-        model = train_model(X, y)
+        # Step 5: Try loading pretrained checkpoint
+        print(f"\n--- Checking for pretrained checkpoint ---")
+        model = load_pretrained_checkpoint()
 
-        if past_deadline():
-            print("\nDeadline reached after training. Fallback submission stands.")
-            return
+        if model is not None:
+            # Pretrained model found — use it directly for predictions
+            print(f"\n--- Submitting pretrained CNN predictions ---")
+            encoded_grids = {}
+            for seed_idx in range(seeds_count):
+                encoded_grids[seed_idx] = encode_initial_grid(
+                    initial_states[seed_idx]["grid"], width, height
+                )
+            submit_cnn_predictions(
+                round_id, model, encoded_grids, initial_states,
+                seeds_count, width, height
+            )
+        else:
+            # No checkpoint — train from observations collected above
+            print(f"\n--- No pretrained checkpoint found, training from observations ---")
 
-        # Step 6: Predict and resubmit (overwrites the fallback)
-        submit_cnn_predictions(
-            round_id, model, encoded_grids, initial_states,
-            seeds_count, width, height
-        )
+            if not observations:
+                print("\nNo observations collected. Fallback submission stands.")
+                return
+
+            # Step 6: Build training data and train CNN
+            print(f"\n--- Building training data ({time_remaining():.0f}s remaining) ---")
+            X, y, encoded_grids = build_training_data(
+                observations, initial_states, width, height
+            )
+
+            if past_deadline():
+                print("\nDeadline reached before training. Fallback submission stands.")
+                return
+
+            print(f"\n--- Training CNN ({time_remaining():.0f}s remaining) ---")
+            model = train_model(X, y)
+
+            if past_deadline():
+                print("\nDeadline reached after training. Fallback submission stands.")
+                return
+
+            # Step 7: Predict and resubmit (overwrites the fallback)
+            submit_cnn_predictions(
+                round_id, model, encoded_grids, initial_states,
+                seeds_count, width, height
+            )
     except Exception as e:
         print(f"\nERROR in CNN pipeline: {e}")
         print("Fallback submission still stands — you will get a score.")
