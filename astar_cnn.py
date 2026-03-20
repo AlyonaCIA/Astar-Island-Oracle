@@ -379,9 +379,20 @@ def make_model(arch="quick", **kwargs):
 
 def collect_observations(round_id, seeds_count, initial_states, width, height):
     """
-    Query the simulator using a full-size viewport grid with priority ordering.
-    Assumes stochastic simulation: covers all tiles via round-robin, then
-    spends remaining budget on dynamic re-queries and interest-centred viewports.
+    Three-phase viewport query strategy with cross-seed intelligence sharing.
+
+    Phase 1 — SCOUT (5 queries):
+        Query the single most dynamic viewport on each seed.
+        Establishes baseline dynamism and provides cross-seed intelligence.
+
+    Phase 2 — COVERAGE (budget-dependent):
+        Use greedy entropy-weighted viewports (skip static regions).
+        Cross-seed intelligence boosts viewports near observed dynamic areas.
+        Targets ~6-7 viewports/seed (covers ~95% of scoring entropy).
+
+    Phase 3 — DEEP RESAMPLE (remaining budget):
+        Re-query the most dynamic observed viewports across all seeds.
+        Multiple observations per cell → better distribution estimates.
     """
     budget = check_budget()
     if not budget:
@@ -391,170 +402,173 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
         print("No queries remaining — will train on priors only.")
         return []
 
-    # --- 1. Compute non-overlapping tile partition ---
-    tiles = compute_tile_grid(width, height)
-    n_tiles = len(tiles)
-
-    # --- 2. Per-seed priority queues ---
-    seed_queues = []
-    for s in range(seeds_count):
-        grid = initial_states[s]["grid"]
-        scored = [(score_tile(grid, t, width, height), t) for t in tiles]
-        scored.sort(reverse=True)
-        seed_queues.append(scored)
-
     observations = []
     seed_obs = [[] for _ in range(seeds_count)]
     queries_done = 0
-
     query_limit = remaining
-    total_needed = n_tiles * seeds_count
-    print(f"  Strategy (STOCHASTIC): {n_tiles} tiles/seed × {seeds_count} seeds = "
-          f"{total_needed} for full coverage  (budget {remaining})")
 
-    # --- 4. Round-robin with re-ranking ---
-    round_num = 0
+    # Build per-seed interest heatmaps from initial terrain
+    seed_interest = []
+    for s in range(seeds_count):
+        grid = initial_states[s]["grid"]
+        interest = build_interest_heatmap(grid, width, height)
+        seed_interest.append(interest)
 
-    while queries_done < query_limit:
-        if past_deadline():
-            print(f"  Deadline reached after {queries_done} queries")
+    def _do_query(seed, tx, ty, tw, th, phase_label):
+        """Execute a single query and record the observation. Returns True if budget exhausted."""
+        nonlocal queries_done
+        try:
+            result = simulate(round_id, seed, tx, ty, tw, th)
+            vp = result["viewport"]
+            obs = {"seed_index": seed, "viewport": vp, "grid": result["grid"]}
+            observations.append(obs)
+            seed_obs[seed].append(obs)
+            queries_done += 1
+
+            used = result.get("queries_used", "?")
+            max_q = result.get("queries_max", "?")
+            print(f"  {phase_label}: seed {seed} ({vp['x']},{vp['y']}) "
+                  f"{vp['w']}x{vp['h']}  budget {used}/{max_q}")
+
+            if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
+                return True  # budget exhausted
+            return False
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                return True  # treat rate limit as budget stop
+            raise
+
+    # ── Phase 1: SCOUT — one query per seed on the most interesting viewport ──
+    print(f"  Strategy: 3-phase (scout → coverage → resample), budget {remaining}")
+    print(f"  Phase 1: SCOUT ({seeds_count} queries)")
+
+    for s in range(seeds_count):
+        if queries_done >= query_limit or past_deadline():
             break
+        # Pick the single best greedy viewport for this seed
+        scout_vps = compute_greedy_viewports(
+            seed_interest[s], width, height, n_viewports=1
+        )
+        if scout_vps:
+            tx, ty, tw, th = scout_vps[0]
+            exhausted = _do_query(s, tx, ty, tw, th, "Scout")
+            if exhausted:
+                _save_observations(observations, round_id)
+                return observations
 
-        # Re-rank remaining tiles after each full round (except first)
-        if round_num > 0:
-            for s in range(seeds_count):
-                if not seed_queues[s]:
-                    continue
-                grid = initial_states[s]["grid"]
-                rescored = [
-                    (rescore_tile(t, grid, seed_obs[s], width, height, sc), t)
-                    for sc, t in seed_queues[s]
-                ]
-                rescored.sort(reverse=True)
-                seed_queues[s] = rescored
+    # ── Cross-seed intelligence: build dynamism heatmap from scout results ──
+    # Since all seeds share hidden parameters, observed dynamism on any seed
+    # predicts dynamism at similar positions on other seeds.
+    cross_seed_dynamism = np.zeros((height, width), dtype=np.float32)
+    for s in range(seeds_count):
+        grid = initial_states[s]["grid"]
+        dyn = build_observed_dynamism_heatmap(seed_obs[s], grid, width, height)
+        cross_seed_dynamism += dyn
 
-        queried_any = False
+    # Boost interest heatmaps with cross-seed dynamism
+    boosted_interest = []
+    for s in range(seeds_count):
+        boosted = seed_interest[s].copy()
+        # Add dynamism signal (soft: scale by 2.0 to make it influential)
+        if cross_seed_dynamism.sum() > 0:
+            boosted += 2.0 * cross_seed_dynamism / max(cross_seed_dynamism.max(), 1.0)
+        # Zero out already-queried areas for this seed
+        for obs in seed_obs[s]:
+            vp = obs["viewport"]
+            boosted[vp["y"]:vp["y"]+vp["h"], vp["x"]:vp["x"]+vp["w"]] = 0
+        boosted_interest.append(boosted)
+
+    # ── Phase 2: COVERAGE — greedy viewports, skip static areas ──
+    # Budget: reserve ~3 queries/seed for resampling in phase 3
+    resample_reserve = min(seeds_count * 3, query_limit // 3)
+    coverage_budget = query_limit - queries_done - resample_reserve
+    vps_per_seed = max(1, coverage_budget // seeds_count)
+    # Cap at 6 viewports per seed (7 total with scout = ~95% entropy coverage)
+    vps_per_seed = min(vps_per_seed, 6)
+
+    print(f"  Phase 2: COVERAGE ({vps_per_seed} viewports/seed, "
+          f"{resample_reserve} reserved for resampling)")
+
+    # Compute greedy viewports for each seed
+    seed_coverage_vps = []
+    for s in range(seeds_count):
+        vps = compute_greedy_viewports(
+            boosted_interest[s], width, height,
+            n_viewports=vps_per_seed, min_spacing=3
+        )
+        seed_coverage_vps.append(vps)
+
+    # Round-robin across seeds for fair coverage
+    max_vps = max(len(vps) for vps in seed_coverage_vps) if seed_coverage_vps else 0
+    for vp_idx in range(max_vps):
         for s in range(seeds_count):
-            if past_deadline() or queries_done >= query_limit:
+            if queries_done >= query_limit - resample_reserve or past_deadline():
                 break
-            if not seed_queues[s]:
+            if vp_idx >= len(seed_coverage_vps[s]):
                 continue
+            tx, ty, tw, th = seed_coverage_vps[s][vp_idx]
+            exhausted = _do_query(s, tx, ty, tw, th, f"Cover {vp_idx+2}")
+            if exhausted:
+                _save_observations(observations, round_id)
+                return observations
 
-            _, (tx, ty, tw, th) = seed_queues[s].pop(0)
-            try:
-                result = simulate(round_id, s, tx, ty, tw, th)
-                vp = result["viewport"]
-                obs = {"seed_index": s, "viewport": vp, "grid": result["grid"]}
-                observations.append(obs)
-                seed_obs[s].append(obs)
-                queries_done += 1
-                queried_any = True
+    # ── Update cross-seed dynamism after coverage phase ──
+    cross_seed_dynamism = np.zeros((height, width), dtype=np.float32)
+    for s in range(seeds_count):
+        grid = initial_states[s]["grid"]
+        dyn = build_observed_dynamism_heatmap(seed_obs[s], grid, width, height)
+        cross_seed_dynamism += dyn
 
-                tiles_left = len(seed_queues[s])
-                used = result.get("queries_used", "?")
-                max_q = result.get("queries_max", "?")
-                print(f"  Seed {s} tile {n_tiles - tiles_left}/{n_tiles}: "
-                      f"({vp['x']},{vp['y']}) {vp['w']}x{vp['h']}  "
-                      f"budget {used}/{max_q}")
+    # ── Phase 3: DEEP RESAMPLE — re-query most dynamic observed viewports ──
+    resample_budget = query_limit - queries_done
+    if resample_budget > 0 and not past_deadline():
+        print(f"  Phase 3: RESAMPLE ({resample_budget} queries on most dynamic viewports)")
 
-                if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
-                    print("  Budget exhausted!")
-                    _save_observations(observations, round_id)
-                    return observations
-
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
-                    print(f"  Rate limited at seed {s}")
-                    _save_observations(observations, round_id)
-                    return observations
-                raise
-
-        if not queried_any:
-            break
-        round_num += 1
-
-    # --- 4. Extra queries on most dynamic tiles ---
-    if queries_done < query_limit and not past_deadline():
-        extra_budget = query_limit - queries_done
-        print(f"  Full coverage done ({queries_done} queries). "
-              f"Using {extra_budget} extra queries on dynamic tiles.")
-
-        # Score each observed tile by change rate from initial state
-        tile_dynamics = []  # (change_rate, seed, tile_xywh)
+        # Rank all observed viewports by change rate
+        resample_candidates = []  # (change_rate, seed, viewport_xywh)
         for s in range(seeds_count):
             grid = initial_states[s]["grid"]
             for obs in seed_obs[s]:
+                rate = compute_obs_change_rate(obs, grid, width, height)
                 vp = obs["viewport"]
-                obs_grid = obs["grid"]
-                changes = 0
-                total = 0
-                for dy in range(len(obs_grid)):
-                    for dx in range(len(obs_grid[0])):
-                        oy, ox = vp["y"] + dy, vp["x"] + dx
-                        if 0 <= oy < height and 0 <= ox < width:
-                            if terrain_to_class(grid[oy][ox]) != terrain_to_class(obs_grid[dy][dx]):
-                                changes += 1
-                            total += 1
-                if total > 0:
-                    tile_dynamics.append((changes / total, s,
-                                          (vp["x"], vp["y"], vp["w"], vp["h"])))
-        tile_dynamics.sort(reverse=True)
+                resample_candidates.append(
+                    (rate, s, (vp["x"], vp["y"], vp["w"], vp["h"]))
+                )
+        resample_candidates.sort(reverse=True)
 
-        # Also generate interest-centered extra viewports (always 15×15)
-        extra_interest = []
+        # Also include cross-seed-informed viewports for under-sampled seeds
+        obs_counts = [len(seed_obs[s]) for s in range(seeds_count)]
+        min_obs = min(obs_counts) if obs_counts else 0
         for s in range(seeds_count):
-            grid = initial_states[s]["grid"]
-            queried_tiles = [(o["viewport"]["x"], o["viewport"]["y"],
-                              o["viewport"]["w"], o["viewport"]["h"])
-                             for o in seed_obs[s]]
-            interest_vps = compute_interest_viewports(
-                grid, width, height, existing_tiles=queried_tiles,
-                n_extra=max(2, extra_budget // seeds_count)
-            )
-            for ivp in interest_vps:
-                # Score by initial interest (approximate)
-                sc = score_tile(grid, ivp, width, height)
-                extra_interest.append((sc, s, ivp))
-        extra_interest.sort(reverse=True)
+            if obs_counts[s] <= min_obs and cross_seed_dynamism.sum() > 0:
+                # Add a viewport centered on the peak cross-seed dynamism
+                # that hasn't been queried on this seed yet
+                extra_interest = cross_seed_dynamism.copy()
+                for obs in seed_obs[s]:
+                    vp = obs["viewport"]
+                    extra_interest[vp["y"]:vp["y"]+vp["h"], vp["x"]:vp["x"]+vp["w"]] *= 0.3
+                extra_vps = compute_greedy_viewports(
+                    extra_interest, width, height, n_viewports=1, min_spacing=3
+                )
+                if extra_vps:
+                    tx, ty, tw, th = extra_vps[0]
+                    rate = extra_interest[ty:ty+th, tx:tx+tw].sum() / (tw * th)
+                    resample_candidates.append((rate, s, (tx, ty, tw, th)))
+        resample_candidates.sort(reverse=True)
 
-        # Interleave: prioritise observed-dynamic re-queries, then interest viewports
-        extra_targets = []
-        di, ii = 0, 0
-        while len(extra_targets) < extra_budget:
-            added = False
-            if di < len(tile_dynamics):
-                extra_targets.append(tile_dynamics[di])
-                di += 1
-                added = True
-            if ii < len(extra_interest) and len(extra_targets) < extra_budget:
-                extra_targets.append(extra_interest[ii])
-                ii += 1
-                added = True
-            if not added:
+        # Round-robin resample: cycle through top candidates
+        resample_idx = 0
+        while queries_done < query_limit and not past_deadline():
+            if resample_idx >= len(resample_candidates):
+                resample_idx = 0  # cycle
+            if not resample_candidates:
                 break
-
-        for score_val, s, (tx, ty, tw, th) in extra_targets:
-            if queries_done >= query_limit or past_deadline():
+            rate, s, (tx, ty, tw, th) = resample_candidates[resample_idx]
+            resample_idx += 1
+            exhausted = _do_query(s, tx, ty, tw, th,
+                                  f"Resample (dyn={rate:.2f})")
+            if exhausted:
                 break
-            try:
-                result = simulate(round_id, s, tx, ty, tw, th)
-                vp = result["viewport"]
-                obs = {"seed_index": s, "viewport": vp, "grid": result["grid"]}
-                observations.append(obs)
-                seed_obs[s].append(obs)
-                queries_done += 1
-
-                used = result.get("queries_used", "?")
-                max_q = result.get("queries_max", "?")
-                print(f"  Extra: seed {s} ({vp['x']},{vp['y']}) {vp['w']}x{vp['h']}  "
-                      f"score={score_val:.2f}  budget {used}/{max_q}")
-
-                if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
-                    break
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
-                    break
-                raise
 
     _save_observations(observations, round_id)
     return observations
@@ -656,78 +670,27 @@ def score_tile(initial_grid, tile, width, height):
     return score
 
 
-def rescore_tile(tile, initial_grid, seed_observations, width, height,
-                 base_score):
+def build_interest_heatmap(initial_grid, width, height):
     """
-    Re-score an unqueried tile after observing other tiles for the same seed.
-    Boosts priority if nearby observed tiles show dynamic activity (cells that
-    changed from their initial state).
+    Build a per-cell interest score from initial terrain.
+    Higher values = more likely to be dynamic / contribute to scoring entropy.
+    Used by the greedy viewport placement algorithm.
     """
-    if not seed_observations:
-        return base_score
-
-    tx, ty, tw, th = tile
-    tile_cx = tx + tw / 2.0
-    tile_cy = ty + th / 2.0
-    bonus = 0.0
-
-    for obs in seed_observations:
-        vp = obs["viewport"]
-        obs_grid = obs["grid"]
-        obs_cx = vp["x"] + vp["w"] / 2.0
-        obs_cy = vp["y"] + vp["h"] / 2.0
-
-        dist = ((tile_cx - obs_cx) ** 2 + (tile_cy - obs_cy) ** 2) ** 0.5
-        if dist > 30:
-            continue
-        proximity = max(0.0, 1.0 - dist / 30.0)
-
-        # Count cells that changed from initial state
-        changes = 0
-        total = 0
-        for dy in range(len(obs_grid)):
-            for dx in range(len(obs_grid[0])):
-                oy, ox = vp["y"] + dy, vp["x"] + dx
-                if 0 <= oy < height and 0 <= ox < width:
-                    initial_cls = terrain_to_class(initial_grid[oy][ox])
-                    observed_cls = terrain_to_class(obs_grid[dy][dx])
-                    total += 1
-                    if initial_cls != observed_cls:
-                        changes += 1
-
-        if total > 0:
-            change_rate = changes / total
-            bonus += change_rate * proximity * 5.0
-
-    return base_score + bonus
-
-
-def compute_interest_viewports(initial_grid, width, height, max_tile=15,
-                               existing_tiles=None, n_extra=5):
-    """
-    Generate extra viewport positions centred on the most dynamic/interesting
-    map regions.  Each viewport is always max_tile×max_tile, clamped to bounds.
-
-    Ranks every possible viewport position by an interest heatmap built from
-    the initial terrain, then returns the top-n positions that are most
-    different from the already-queried tiles.
-    """
-    # Build per-cell interest score
     interest = np.zeros((height, width), dtype=np.float32)
     for y in range(height):
         for x in range(width):
             cell = initial_grid[y][x]
-            if cell == 1:        # Settlement
+            if cell == 1:         # Settlement — highly dynamic
                 interest[y, x] = 5.0
-            elif cell == 2:      # Port
+            elif cell == 2:       # Port — dynamic + trade
                 interest[y, x] = 6.0
-            elif cell == 4:      # Forest
+            elif cell == 4:       # Forest — mostly static, supports settlements
                 interest[y, x] = 0.3
-            elif cell in (0, 11):  # Plains
+            elif cell in (0, 11): # Plains — expansion potential
                 interest[y, x] = 0.5
-            # Ocean/Mountain stay 0
+            # Ocean (10) and Mountain (5): 0 — completely static
 
-    # Coastal bonus
+    # Coastal bonus — land cells adjacent to ocean have port/expansion potential
     for y in range(height):
         for x in range(width):
             if interest[y, x] > 0:
@@ -737,53 +700,111 @@ def compute_interest_viewports(initial_grid, width, height, max_tile=15,
                             interest[y, x] += 0.3
                             break
 
-    # Summed area table for fast viewport scoring
-    sat = np.zeros((height + 1, width + 1), dtype=np.float64)
+    # Settlement proximity bonus — cells near settlements gain interest
+    # because settlements expand, raid, and create ruins in their vicinity
+    settlement_positions = []
     for y in range(height):
         for x in range(width):
-            sat[y+1, x+1] = interest[y, x] + sat[y, x+1] + sat[y+1, x] - sat[y, x]
+            if initial_grid[y][x] in (1, 2):
+                settlement_positions.append((y, x))
 
-    def viewport_score(vx, vy, vw, vh):
-        return (sat[vy+vh, vx+vw] - sat[vy, vx+vw] - sat[vy+vh, vx] + sat[vy, vx])
+    for y in range(height):
+        for x in range(width):
+            if interest[y, x] > 0 and initial_grid[y][x] not in (1, 2):
+                for sy, sx in settlement_positions:
+                    dist = abs(y - sy) + abs(x - sx)  # Manhattan distance
+                    if dist <= 5:
+                        interest[y, x] += max(0, (5 - dist)) * 0.3
 
-    # Existing tile centers for diversity penalty
-    existing_centers = []
-    if existing_tiles:
-        for (ex, ey, ew, eh) in existing_tiles:
-            existing_centers.append((ex + ew / 2.0, ey + eh / 2.0))
+    return interest
 
-    max_x = width - max_tile
-    max_y = height - max_tile
-    candidates = []
-    # Sample every possible position (stride 1 on a 40×40 map is only ~676 positions)
-    for vy in range(max(0, max_y) + 1):
-        for vx in range(max(0, max_x) + 1):
-            score = viewport_score(vx, vy, max_tile, max_tile)
-            # Diversity: penalise overlap with existing tile centers
-            cx, cy = vx + max_tile / 2.0, vy + max_tile / 2.0
-            for ecx, ecy in existing_centers:
-                dist = ((cx - ecx)**2 + (cy - ecy)**2) ** 0.5
-                if dist < max_tile:
-                    score *= (0.3 + 0.7 * dist / max_tile)  # mild penalty
-            candidates.append((score, vx, vy))
 
-    candidates.sort(reverse=True)
+def compute_greedy_viewports(interest, width, height, n_viewports,
+                             max_tile=15, min_spacing=5):
+    """
+    Greedily place viewports to maximize total covered interest.
 
-    # Deduplicate: skip candidates too close to already selected ones
+    At each step, picks the 15×15 viewport position that maximizes
+    *uncovered* interest, then marks those cells as covered.
+    Returns list of (x, y, w, h) tuples.
+    """
+    # Summed area table for fast viewport scoring
+    remaining = interest.copy()
     selected = []
-    for score, vx, vy in candidates:
-        if len(selected) >= n_extra:
-            break
-        cx, cy = vx + max_tile / 2.0, vy + max_tile / 2.0
-        too_close = False
-        for sx, sy in selected:
-            if abs(cx - (sx + max_tile/2.0)) < 3 and abs(cy - (sy + max_tile/2.0)) < 3:
-                too_close = True
-                break
-        if not too_close:
-            selected.append((vx, vy))
 
-    return [(vx, vy, max_tile, max_tile) for vx, vy in selected]
+    max_x = max(0, width - max_tile)
+    max_y = max(0, height - max_tile)
+
+    for _ in range(n_viewports):
+        # Build SAT from remaining interest
+        sat = np.zeros((height + 1, width + 1), dtype=np.float64)
+        for y in range(height):
+            for x in range(width):
+                sat[y+1, x+1] = remaining[y, x] + sat[y, x+1] + sat[y+1, x] - sat[y, x]
+
+        best_score = -1
+        best_pos = (0, 0)
+        for vy in range(max_y + 1):
+            for vx in range(max_x + 1):
+                score = (sat[vy+max_tile, vx+max_tile] - sat[vy, vx+max_tile]
+                         - sat[vy+max_tile, vx] + sat[vy, vx])
+                if score > best_score:
+                    # Check minimum spacing from already selected viewports
+                    cx, cy = vx + max_tile / 2.0, vy + max_tile / 2.0
+                    too_close = False
+                    for sx, sy, _, _ in selected:
+                        scx, scy = sx + max_tile / 2.0, sy + max_tile / 2.0
+                        if abs(cx - scx) < min_spacing and abs(cy - scy) < min_spacing:
+                            too_close = True
+                            break
+                    if not too_close:
+                        best_score = score
+                        best_pos = (vx, vy)
+
+        if best_score <= 0:
+            break
+        vx, vy = best_pos
+        selected.append((vx, vy, max_tile, max_tile))
+        # Zero out the covered area so next viewport picks uncovered regions
+        remaining[vy:vy+max_tile, vx:vx+max_tile] = 0
+
+    return selected
+
+
+def compute_obs_change_rate(obs, initial_grid, width, height):
+    """Fraction of cells in an observation viewport that changed from initial state."""
+    vp = obs["viewport"]
+    obs_grid = obs["grid"]
+    changes = 0
+    total = 0
+    for dy in range(len(obs_grid)):
+        for dx in range(len(obs_grid[0])):
+            oy, ox = vp["y"] + dy, vp["x"] + dx
+            if 0 <= oy < height and 0 <= ox < width:
+                if terrain_to_class(initial_grid[oy][ox]) != terrain_to_class(obs_grid[dy][dx]):
+                    changes += 1
+                total += 1
+    return changes / max(total, 1)
+
+
+def build_observed_dynamism_heatmap(seed_observations, initial_grid, width, height):
+    """
+    Build a per-cell dynamism heatmap from observations.
+    Cells that changed from initial state get a high score.
+    Cells near changed cells get a distance-decayed bonus.
+    Used to guide re-sampling and cross-seed intelligence.
+    """
+    dynamism = np.zeros((height, width), dtype=np.float32)
+    for obs in seed_observations:
+        vp = obs["viewport"]
+        obs_grid = obs["grid"]
+        for dy in range(len(obs_grid)):
+            for dx in range(len(obs_grid[0])):
+                oy, ox = vp["y"] + dy, vp["x"] + dx
+                if 0 <= oy < height and 0 <= ox < width:
+                    if terrain_to_class(initial_grid[oy][ox]) != terrain_to_class(obs_grid[dy][dx]):
+                        dynamism[oy, ox] += 1.0
+    return dynamism
 
 
 def plan_viewports(width, height, num_queries, vw=15, vh=15):
@@ -1182,8 +1203,8 @@ def main():
 
         if model is not None:
             # Pretrained model found — use it directly for predictions
-            # If we have observations, blend them with CNN predictions
-            print(f"\n--- Submitting pretrained CNN predictions ---")
+            # Pass observations so unet_obs can use them as input channels
+            print(f"\n--- Submitting pretrained CNN predictions (arch={MODEL_ARCH}) ---")
             encoded_grids = {}
             for seed_idx in range(seeds_count):
                 encoded_grids[seed_idx] = encode_initial_grid(
@@ -1192,6 +1213,8 @@ def main():
             submit_cnn_predictions(
                 round_id, model, encoded_grids, initial_states,
                 seeds_count, width, height,
+                observations=observations,
+                arch=MODEL_ARCH,
             )
         else:
             # No checkpoint — train from observations collected above
