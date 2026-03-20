@@ -10,11 +10,11 @@ Our toolkit for the **Astar Island** ML challenge — a Norse civilisation simul
 - [What This Codebase Does](#what-this-codebase-does)
 - [Setup](#setup)
 - [Production Pipeline](#production-pipeline)
-  - [Architecture — unet\_sim](#architecture--unet_sim)
+  - [Architecture — unet\_cond](#architecture--unet_cond)
   - [Viewport Strategy — Coverage First](#viewport-strategy--coverage-first)
   - [Observation Encoding](#observation-encoding)
-  - [Training — Offline with Replay Data](#training--offline-with-replay-data)
-  - [Cross-Validation — Leave-One-Round-Out](#cross-validation--leave-one-round-out)
+  - [Training — Offline with Multi-Replay Data](#training--offline-with-multi-replay-data)
+  - [Cross-Validation](#cross-validation)
   - [Observation Dropout](#observation-dropout)
   - [Automated Pipeline — cron.py](#automated-pipeline--cronpy)
 - [Manual Training & Evaluation](#manual-training--evaluation)
@@ -70,9 +70,9 @@ pip install requests numpy torch
 
 ## Production Pipeline
 
-The production system uses **unet_sim** — a MiniUNet trained on simulation replay data with observation-conditioned input channels.
+The production system uses **unet_cond** — a MiniUNet trained on multi-replay observation data with entropy-weighted KL loss matching the competition metric.
 
-### Architecture — unet_sim
+### Architecture — unet_cond
 
 **Input:** 21 channels = 14 terrain features + 7 observation channels
 - Channels 0–7: one-hot terrain encoding (8 terrain types)
@@ -127,37 +127,55 @@ Viewport query results are encoded into 7 channels via `encode_obs_channels()`:
 
 Multiple observations of the same cell (from overlapping tiles or resample queries) are **averaged into frequencies**, capturing the stochastic variation. Unobserved cells are all zeros — the model learns to fall back to terrain-only prediction for these.
 
-### Training — Offline with Replay Data
+### Training — Offline with Multi-Replay Data
 
 **Data sources:**
-- **Ground truth:** 35 samples in `data/ground_truth/` (rounds 1–7, 5 seeds each). Each is a 40×40×6 probability tensor from Monte Carlo simulation.
+- **Ground truth:** 40 samples in `data/ground_truth/` (rounds 1–8, 5 seeds each). Each is a 40×40×6 probability tensor from Monte Carlo simulation.
 - **Simulation replays:** 40 files in `simulation_replays/` (rounds 1–8, 5 seeds each). Each contains 51 frames (years 0–50) of the full 40×40 grid.
 
-**Synthetic observation generation** (`sample_synthetic_obs_channels`):
+**Multi-replay observation generation** (`sample_multi_replay_obs_channels`):
 
-For each ground truth sample with a matching replay, the training pipeline:
-1. Takes the replay's final frame (year 50) as a plausible simulation outcome
-2. Samples viewport observations from this frame, encoding them as 7 observation channels
-3. Creates 3 copies per map with different viewport patterns:
-   - **60% chance:** systematic tile grid (matches production layout)
-   - **40% chance:** random 6–12 viewports (adds training diversity)
-4. Creates 1 additional copy with **zero observations** (teaches terrain-only fallback)
+In production, each viewport query triggers an independent stochastic simulation — so different viewports observe different random outcomes even on the same seed. The training pipeline replicates this:
 
-After augmentation (4 rotations × 2 flips = 8×), this yields ~1,120 training maps from 35 ground truth samples.
+1. Loads all 5 replay grids (final frames) for the round
+2. Places viewports using the same systematic 3×3 tile grid as production
+3. For each tile, randomly selects one of the 5 available replay grids — so overlapping tiles may show different stochastic outcomes, just like production
+4. Encodes the result as 7 observation channels (6 class frequencies + coverage)
 
-**Known limitation:** Each training sample's observations come from a single replay realization. In production, observations aggregate multiple independent stochastic simulations, so the empirical frequencies are richer. The model compensates by training on varied viewport patterns and using observation dropout.
+For each ground truth sample:
+- **3 copies** with different random multi-replay observation patterns
+- **1 copy** with zero observations (teaches terrain-only fallback)
 
-### Cross-Validation — Leave-One-Round-Out
+This yields **160 training maps** from 40 ground truth samples (no rotation/flip augmentation — observation spatial patterns must match production).
 
-**Production default: `--cv round`** (leave-one-round-out)
+**Loss function:** Entropy-weighted KL divergence, matching the competition scoring metric exactly:
+$$\text{loss} = \frac{\sum_{\text{cell}} \text{KL}(\text{cell}) \cdot H(\text{cell})}{\sum_{\text{cell}} H(\text{cell})}$$
+where $H(\text{cell})$ is the entropy of the ground truth distribution. Only dynamic cells (non-zero entropy) contribute — static cells like deep ocean are ignored. This aligns training directly with competition scoring: $\text{score} = 100 \cdot e^{-3 \cdot \text{loss}}$.
 
-Holds out the most recent round as validation; trains on all other rounds. This directly tests the production scenario: **can the model predict a never-before-seen map?**
+### Cross-Validation
+
+`unet_cond` supports 4 cross-validation modes:
+
+| Mode | Flag | What it does | Use case |
+|------|------|-------------|----------|
+| **All data** | `--cv all` | Trains on everything, no holdout | **Production** (default for `unet_cond`) |
+| **Round K-fold** | `--cv round_kfold` | K fresh models (one per round as holdout), reports mean ± std | **Evaluation** — reliable generalization estimate |
+| **Leave-one-round-out** | `--cv round` | Holds out latest round as validation | Quick single-split estimate |
+| **4-fold quadrant** | `--cv quadrant` | Spatial split, holds out one map quadrant per fold | Terrain-only models (no obs channels) |
+
+**Production (`--cv all`):** Trains on all available data with no holdout. Since the model will face entirely new maps in production, withholding data for validation only reduces training signal. The model is evaluated separately using `--cv round_kfold`.
+
+**Evaluation (`--cv round_kfold`):** The gold-standard evaluation mode. Trains K separate models from scratch (K = number of rounds), each holding out one round. Reports per-fold and mean ± std validation loss. This answers: **how well does the model generalize to a never-before-seen map?**
 
 ```bash
-python train_cnn.py --model unet_sim --cv round
+# Evaluate generalization (trains K fresh models):
+python train_cnn.py --model unet_cond --cv round_kfold
+
+# Train for production (all data, no holdout):
+python train_cnn.py --model unet_cond --cv all
 ```
 
-**Why not quadrant CV?** The 4-fold quadrant approach (hold out one spatial quadrant per fold) tests whether the model can interpolate within a known map. This is NOT what happens in production — the model faces a brand-new map with different terrain. Additionally, quadrant CV combined with rotation augmentation leaks validation data (a rotated map's held-out quadrant contains pixels from the original map's training region).
+**Why not quadrant CV for obs-conditioned models?** The model takes observation channels as input covering the full 40×40 map. In quadrant CV, the held-out quadrant's pixels are masked from the *target* but their observation channels remain visible in the *input* — leaking the answer. Round-based CV holds out entire maps, so the model never sees any data from the validation round.
 
 **Quadrant CV is still available** for architectures without observation channels:
 ```bash
@@ -173,6 +191,15 @@ During training, observation channels are randomly masked to build robustness:
 | Keep all observations | 65% | Matches production (100% coverage) |
 | Random partial masking (3–9 viewports of 15×15) | 25% | Handles incomplete coverage gracefully |
 | Zero all observations | 10% | Safety net for terrain-only fallback |
+
+### LR Scheduler & Early Stopping
+
+When validation data is available (`--cv round`, `--cv round_kfold`, `--cv quadrant`):
+
+- **ReduceLROnPlateau:** Halves the learning rate after 100 epochs of no validation improvement (min LR: 1e-6)
+- **Early stopping:** Stops training after 300 epochs without validation improvement
+
+When training with `--cv all` (production), neither applies since there is no validation set — the model trains for the full epoch count.
 
 ### Automated Pipeline — cron.py
 
@@ -191,12 +218,12 @@ Configuration (in `cron.py`):
 
 | Setting | Value | Description |
 |---------|-------|-------------|
-| `ARCH` | `unet_sim` | Model architecture |
+| `ARCH` | `unet_cond` | Model architecture |
 | `POLL_INTERVAL_S` | 1200 (20 min) | Check interval |
 | `GT_WAIT_S` | 600 (10 min) | Wait for GT before retrain |
 | `MAX_TRAIN_EPOCHS` | 4000 | Max epochs per training cycle |
 
-Retraining uses `--cv round` and snapshot ensemble (last 3 checkpoints).
+Retraining uses `--cv all` (train on everything) and inference uses snapshot ensemble (last 3 checkpoints).
 
 ```bash
 python cron.py          # run forever
@@ -210,26 +237,32 @@ python cron.py --once   # single cycle
 ### Train
 
 ```bash
-python train_cnn.py --model unet_sim                     # default: --cv round
-python train_cnn.py --model unet_sim --reset              # train from scratch
-python train_cnn.py --model unet_sim --forever            # train until Ctrl+C
-python train_cnn.py --model unet_sim --fetch              # fetch GT from API first
-python train_cnn.py --model unet_sim --epochs 2000        # override epoch count
+# Production model (unet_cond)
+python train_cnn.py --model unet_cond                     # default: --cv all (no holdout)
+python train_cnn.py --model unet_cond --cv round_kfold    # evaluate generalization (K fresh models)
+python train_cnn.py --model unet_cond --reset             # train from scratch
+python train_cnn.py --model unet_cond --forever           # train until Ctrl+C
+python train_cnn.py --model unet_cond --fetch             # fetch GT from API first
+python train_cnn.py --model unet_cond --epochs 2000       # override epoch count
+
+# Other architectures
+python train_cnn.py --model unet_sim --cv round           # leave-one-round-out
 python train_cnn.py --model unet --cv quadrant            # older arch with quadrant CV
 ```
 
 ### Evaluate
 
 ```bash
-python eval_cnn.py --arch unet_sim                        # latest checkpoint
-python eval_cnn.py --arch unet_sim --viewports            # viewport-restricted eval
+python eval_cnn.py --arch unet_cond                       # latest checkpoint
+python eval_cnn.py --arch unet_sim                        # compare against previous
+python eval_cnn.py --arch unet_cond --viewports           # viewport-restricted eval
 ```
 
 ### Compare architectures
 
 ```bash
-python compare_models.py --eval-only --models unet unet_sim
-python compare_models.py --models unet_sim --epochs 500
+python compare_models.py --eval-only                      # eval all existing checkpoints
+python compare_models.py --eval-only --models unet_cond unet_sim
 ```
 
 ---
@@ -276,7 +309,8 @@ Astar-Island-Oracle/
 │   ├── observations_*.json  # Saved viewport queries per round
 │   └── round_*.json         # Cached round metadata
 ├── simulation_replays/      # Replay files: r{N}s{M}.json (51 frames each)
-├── checkpoints_unet_sim/    # unet_sim checkpoints (production)
+├── checkpoints_unet_cond/   # unet_cond checkpoints (production)
+├── checkpoints_unet_sim/    # unet_sim checkpoints
 ├── checkpoints_unet/        # MiniUNet checkpoints
 ├── checkpoints_unet_aug/    # Augmented MiniUNet checkpoints
 ├── checkpoints/             # QuickCNN checkpoints
@@ -287,12 +321,13 @@ Astar-Island-Oracle/
 
 ## All Model Architectures
 
-| Architecture | Input Channels | Params | Description | CV Default |
-|---|---|---|---|---|
-| `unet_sim` | 21 (14 terrain + 7 obs) | ~472K | **Production.** MiniUNet with synthetic replay observations | `round` |
-| `unet_obs` | 21 (14 terrain + 7 obs) | ~472K | MiniUNet with real observation channels | `round` |
-| `unet_v2` | 28 (14 + 7 obs + 7 cross-seed) | ~490K | MiniUNetV2 with cross-seed channels | `round` |
-| `unet_aug` | 14 | ~470K | MiniUNet with augmentation + dropout | `quadrant` |
-| `unet` | 14 | ~470K | MiniUNet (terrain only) | `quadrant` |
-| `quick` | 14 | ~35K | QuickCNN (3-layer, no spatial context) | `quadrant` |
-| `quick3` | 14 | ~35K | QuickCNN3 (3-layer variant) | `quadrant` |
+| Architecture | Input Channels | Params | Description | CV Default | Loss |
+|---|---|---|---|---|---|
+| `unet_cond` | 21 (14 terrain + 7 obs) | ~472K | **Production.** Multi-replay obs, entropy-weighted KL, no augmentation | `all` | entropy-weighted KL |
+| `unet_sim` | 21 (14 terrain + 7 obs) | ~472K | Single-replay obs, rotation augmentation | `round` | KL divergence |
+| `unet_obs` | 21 (14 terrain + 7 obs) | ~472K | MiniUNet with real observation channels | `round` | KL divergence |
+| `unet_v2` | 28 (14 + 7 obs + 7 cross-seed) | ~490K | MiniUNetV2 with cross-seed channels | `round` | KL divergence |
+| `unet_aug` | 14 | ~470K | MiniUNet with augmentation + dropout | `quadrant` | KL divergence |
+| `unet` | 14 | ~470K | MiniUNet (terrain only) | `quadrant` | KL divergence |
+| `quick` | 14 | ~35K | QuickCNN (3-layer, no spatial context) | `quadrant` | KL divergence |
+| `quick3` | 14 | ~35K | QuickCNN3 (3-layer variant) | `quadrant` | KL divergence |
