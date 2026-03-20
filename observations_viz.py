@@ -54,7 +54,12 @@ QUERY_CMAP = plt.cm.tab10
 
 def load_observations(obs_path):
     with open(obs_path) as f:
-        return json.load(f)
+        raw = json.load(f)
+    # New format: {"round_id": ..., "observations": [...]}
+    if isinstance(raw, dict):
+        return raw.get("observations", [])
+    # Old format: bare list
+    return raw
 
 
 def load_round_data(round_path):

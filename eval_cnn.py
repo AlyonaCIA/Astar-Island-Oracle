@@ -33,6 +33,7 @@ from train_cnn import (
     CHECKPOINT_DIR, DEVICE, NUM_CLASSES, PROB_FLOOR, VAL_QUADRANT,
     SCRIPT_DIR as TRAIN_SCRIPT_DIR,
 )
+from astar_cnn import bayesian_blend, terrain_to_class
 
 _load_dotenv()
 
@@ -43,18 +44,35 @@ DATA_DIR = os.path.join(TRAIN_SCRIPT_DIR, "data")
 # Viewport mask loading
 # ---------------------------------------------------------------------------
 
-def load_viewport_masks(round_id_short, height, width, seeds_count=5):
+def load_observations_list(round_id_short):
     """
-    Load cached observations for a round and build per-seed boolean masks.
-    Returns dict: {seed_index: (H, W) bool ndarray} where True = observed pixel.
-    Returns None if no observations file found for this round.
+    Load cached observations for a round.
+    Handles both old format (bare list) and new format (wrapped dict with metadata).
+    Returns list of observation dicts, or None if file not found.
     """
     obs_path = os.path.join(DATA_DIR, f"observations_{round_id_short}.json")
     if not os.path.isfile(obs_path):
         return None
 
     with open(obs_path) as f:
-        observations = json.load(f)
+        raw = json.load(f)
+
+    # New format: {"round_id": ..., "observations": [...]}
+    if isinstance(raw, dict):
+        return raw.get("observations", [])
+    # Old format: bare list
+    return raw
+
+
+def load_viewport_masks(round_id_short, height, width, seeds_count=5):
+    """
+    Load cached observations for a round and build per-seed boolean masks.
+    Returns dict: {seed_index: (H, W) bool ndarray} where True = observed pixel.
+    Returns None if no observations file found for this round.
+    """
+    observations = load_observations_list(round_id_short)
+    if observations is None:
+        return None
 
     masks = {}
     for obs in observations:
@@ -198,12 +216,13 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
         print(f"  Training time: {meta.get('total_training_time_s', '?')}s")
 
     # Pre-load all available observation files
-    obs_index = find_all_observation_files() if use_viewports else {}
-    if use_viewports:
-        if obs_index:
-            print(f"  Viewport observations found for: {list(obs_index.keys())}")
-        else:
-            print("  WARNING: --viewports enabled but no observation files found")
+    obs_index = find_all_observation_files()
+    if obs_index:
+        print(f"  Observations found for rounds: {list(obs_index.keys())}")
+    else:
+        print("  No observation files found (blended eval will be skipped)")
+    if use_viewports and not obs_index:
+        print("  WARNING: --viewports enabled but no observation files found")
 
     model.eval()
 
@@ -242,10 +261,26 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
         uniform_pred = np.full((height, width, NUM_CLASSES), 1.0 / NUM_CLASSES, dtype=np.float32)
         prior_pred = build_prior_prediction(initial_grid, width, height)
 
+        # --- Bayesian blended prediction (CNN + observations) ---
+        blend_pred = None
+        seed_obs = None
+        if round_id_short in obs_index:
+            all_obs = load_observations_list(round_id_short)
+            if all_obs:
+                seed_obs = [o for o in all_obs if o["seed_index"] == seed]
+                if seed_obs:
+                    blend_pred = bayesian_blend(
+                        cnn_pred, seed_obs, initial_grid, width, height
+                    )
+
         # --- Full-map metrics ---
         cnn_score_full, cnn_wkl_full = competition_score(cnn_pred, gt)
         uni_score_full, uni_wkl_full = competition_score(uniform_pred, gt)
         pri_score_full, pri_wkl_full = competition_score(prior_pred, gt)
+        if blend_pred is not None:
+            bln_score_full, bln_wkl_full = competition_score(blend_pred, gt)
+        else:
+            bln_score_full = bln_wkl_full = None
 
         # --- Val-quadrant-only metrics ---
         gt_val = gt[val_mask]                    # (V, 6)
@@ -260,6 +295,12 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
                                   gt_val.reshape(-1, 1, NUM_CLASSES)).mean()
         pri_kl_val = kl_per_pixel(pri_val.reshape(-1, 1, NUM_CLASSES),
                                   gt_val.reshape(-1, 1, NUM_CLASSES)).mean()
+        if blend_pred is not None:
+            bln_val = blend_pred[val_mask]
+            bln_kl_val = kl_per_pixel(bln_val.reshape(-1, 1, NUM_CLASSES),
+                                      gt_val.reshape(-1, 1, NUM_CLASSES)).mean()
+        else:
+            bln_kl_val = None
 
         # Per-class KL breakdown on val quadrant
         cnn_class_kl = []
@@ -276,8 +317,8 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
             cnn_class_kl.append(kl_c)
 
         # --- Viewport-only metrics ---
-        vp_cnn_score = vp_pri_score = vp_uni_score = None
-        vp_cnn_wkl = vp_pri_wkl = vp_uni_wkl = None
+        vp_cnn_score = vp_pri_score = vp_uni_score = vp_bln_score = None
+        vp_cnn_wkl = vp_pri_wkl = vp_uni_wkl = vp_bln_wkl = None
         vp_pixels = 0
         if use_viewports and round_id_short in obs_index:
             vp_masks = load_viewport_masks(round_id_short, height, width)
@@ -289,54 +330,70 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
                     cnn_vp = cnn_pred[vp_mask]             # (P, 6)
                     uni_vp = uniform_pred[vp_mask]
                     pri_vp = prior_pred[vp_mask]
-                    # Reshape to (H, W, 6) equivalent for competition_score
-                    # Use per-pixel KL rather than full weighted_kl for masked subset
                     vp_cnn_wkl = _masked_weighted_kl(cnn_vp, gt_vp)
                     vp_pri_wkl = _masked_weighted_kl(pri_vp, gt_vp)
                     vp_uni_wkl = _masked_weighted_kl(uni_vp, gt_vp)
                     vp_cnn_score = 100.0 * np.exp(-3.0 * vp_cnn_wkl)
                     vp_pri_score = 100.0 * np.exp(-3.0 * vp_pri_wkl)
                     vp_uni_score = 100.0 * np.exp(-3.0 * vp_uni_wkl)
+                    if blend_pred is not None:
+                        bln_vp = blend_pred[vp_mask]
+                        vp_bln_wkl = _masked_weighted_kl(bln_vp, gt_vp)
+                        vp_bln_score = 100.0 * np.exp(-3.0 * vp_bln_wkl)
 
         results.append({
             "round": rnd, "seed": seed,
             "api_score": api_score,
             "cnn_score_full": cnn_score_full,
             "cnn_wkl_full": cnn_wkl_full,
+            "bln_score_full": bln_score_full,
+            "bln_wkl_full": bln_wkl_full,
             "pri_score_full": pri_score_full,
             "uni_score_full": uni_score_full,
             "cnn_kl_val": cnn_kl_val,
+            "bln_kl_val": bln_kl_val,
             "uni_kl_val": uni_kl_val,
             "pri_kl_val": pri_kl_val,
             "cnn_class_kl": cnn_class_kl,
             "vp_cnn_score": vp_cnn_score,
+            "vp_bln_score": vp_bln_score,
             "vp_pri_score": vp_pri_score,
             "vp_uni_score": vp_uni_score,
             "vp_cnn_wkl": vp_cnn_wkl,
+            "vp_bln_wkl": vp_bln_wkl,
             "vp_pri_wkl": vp_pri_wkl,
             "vp_uni_wkl": vp_uni_wkl,
             "vp_pixels": vp_pixels,
         })
 
     # --- Print summary ---
-    print(f"\n{'='*80}")
+    has_blend = any(r["bln_score_full"] is not None for r in results)
+
+    print(f"\n{'='*90}")
     print(f"  EVALUATION RESULTS  (val quadrant = {val_quadrant})")
-    print(f"{'='*80}")
+    print(f"{'='*90}")
+
+    bln_hdr = f" {'Blend':>7}" if has_blend else ""
+    bln_hdr2 = f" {'Score':>7}" if has_blend else ""
+    bln_vhdr = f" {'Bln val':>8}" if has_blend else ""
+    bln_vhdr2 = f" {'KL':>8}" if has_blend else ""
 
     header = (f"  {'Round':>5} {'Seed':>4} | {'API':>6} | "
-              f"{'CNN':>7} {'Prior':>7} {'Unif':>7} | "
-              f"{'CNN val':>8} {'Pri val':>8} {'Uni val':>8}")
+              f"{'CNN':>7}{bln_hdr} {'Prior':>7} {'Unif':>7} | "
+              f"{'CNN val':>8}{bln_vhdr} {'Pri val':>8} {'Uni val':>8}")
     print(header)
     print(f"  {'':>5} {'':>4} | {'Score':>6} | "
-          f"{'Score':>7} {'Score':>7} {'Score':>7} | "
-          f"{'KL':>8} {'KL':>8} {'KL':>8}")
-    print("  " + "-" * 76)
+          f"{'Score':>7}{bln_hdr2} {'Score':>7} {'Score':>7} | "
+          f"{'KL':>8}{bln_vhdr2} {'KL':>8} {'KL':>8}")
+    print("  " + "-" * (76 + (16 if has_blend else 0)))
 
     for r in results:
         api = f"{r['api_score']:.1f}" if r['api_score'] is not None else "  n/a"
+        bln_s = f" {r['bln_score_full']:>7.2f}" if r['bln_score_full'] is not None else (" " + "    n/a") if has_blend else ""
+        bln_v = f" {r['bln_kl_val']:>8.5f}" if r['bln_kl_val'] is not None else (" " + "     n/a") if has_blend else ""
         print(f"  R{r['round']:>4} S{r['seed']:>3} | {api:>6} | "
-              f"{r['cnn_score_full']:>7.2f} {r['pri_score_full']:>7.2f} {r['uni_score_full']:>7.2f} | "
-              f"{r['cnn_kl_val']:>8.5f} {r['pri_kl_val']:>8.5f} {r['uni_kl_val']:>8.5f}")
+              f"{r['cnn_score_full']:>7.2f}{bln_s} {r['pri_score_full']:>7.2f} {r['uni_score_full']:>7.2f} | "
+              f"{r['cnn_kl_val']:>8.5f}{bln_v} {r['pri_kl_val']:>8.5f} {r['uni_kl_val']:>8.5f}")
 
     # Averages
     if results:
@@ -346,28 +403,48 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
         avg_cnn_kl = np.mean([r["cnn_kl_val"] for r in results])
         avg_pri_kl = np.mean([r["pri_kl_val"] for r in results])
         avg_uni_kl = np.mean([r["uni_kl_val"] for r in results])
-        print("  " + "-" * 76)
+
+        bln_results = [r for r in results if r["bln_score_full"] is not None]
+        if bln_results:
+            avg_bln = np.mean([r["bln_score_full"] for r in bln_results])
+            avg_bln_kl = np.mean([r["bln_kl_val"] for r in bln_results])
+            bln_avg_s = f" {avg_bln:>7.2f}"
+            bln_avg_v = f" {avg_bln_kl:>8.5f}"
+        else:
+            bln_avg_s = (" " + "    n/a") if has_blend else ""
+            bln_avg_v = (" " + "     n/a") if has_blend else ""
+
+        print("  " + "-" * (76 + (16 if has_blend else 0)))
         print(f"  {'AVG':>10} | {'':>6} | "
-              f"{avg_cnn:>7.2f} {avg_pri:>7.2f} {avg_uni:>7.2f} | "
-              f"{avg_cnn_kl:>8.5f} {avg_pri_kl:>8.5f} {avg_uni_kl:>8.5f}")
+              f"{avg_cnn:>7.2f}{bln_avg_s} {avg_pri:>7.2f} {avg_uni:>7.2f} | "
+              f"{avg_cnn_kl:>8.5f}{bln_avg_v} {avg_pri_kl:>8.5f} {avg_uni_kl:>8.5f}")
 
     # --- Viewport results ---
     vp_results = [r for r in results if r["vp_cnn_score"] is not None]
     if vp_results:
-        print(f"\n{'='*80}")
+        has_vp_blend = any(r["vp_bln_score"] is not None for r in vp_results)
+        bvh = f" {'Blend':>7}" if has_vp_blend else ""
+        bvh2 = f" {'Score':>7}" if has_vp_blend else ""
+        bvw = f" {'Blend':>10}" if has_vp_blend else ""
+        bvw2 = f" {'WKL':>10}" if has_vp_blend else ""
+        vp_sep = 82 + (18 if has_vp_blend else 0)
+
+        print(f"\n{'='*max(80, vp_sep+4)}")
         print(f"  VIEWPORT-ONLY RESULTS  (pixels you actually observed)")
-        print(f"{'='*80}")
+        print(f"{'='*max(80, vp_sep+4)}")
         print(f"  {'Round':>5} {'Seed':>4} | {'Pixels':>6} | "
-              f"{'CNN':>7} {'Prior':>7} {'Unif':>7} | "
-              f"{'CNN':>10} {'Prior':>10} {'Unif':>10}")
+              f"{'CNN':>7}{bvh} {'Prior':>7} {'Unif':>7} | "
+              f"{'CNN':>10}{bvw} {'Prior':>10} {'Unif':>10}")
         print(f"  {'':>5} {'':>4} | {'':>6} | "
-              f"{'Score':>7} {'Score':>7} {'Score':>7} | "
-              f"{'WKL':>10} {'WKL':>10} {'WKL':>10}")
-        print("  " + "-" * 82)
+              f"{'Score':>7}{bvh2} {'Score':>7} {'Score':>7} | "
+              f"{'WKL':>10}{bvw2} {'WKL':>10} {'WKL':>10}")
+        print("  " + "-" * vp_sep)
         for r in vp_results:
+            bvs = f" {r['vp_bln_score']:>7.2f}" if r['vp_bln_score'] is not None else (" " + "    n/a") if has_vp_blend else ""
+            bvwk = f" {r['vp_bln_wkl']:>10.5f}" if r['vp_bln_wkl'] is not None else (" " + "       n/a") if has_vp_blend else ""
             print(f"  R{r['round']:>4} S{r['seed']:>3} | {r['vp_pixels']:>6} | "
-                  f"{r['vp_cnn_score']:>7.2f} {r['vp_pri_score']:>7.2f} {r['vp_uni_score']:>7.2f} | "
-                  f"{r['vp_cnn_wkl']:>10.5f} {r['vp_pri_wkl']:>10.5f} {r['vp_uni_wkl']:>10.5f}")
+                  f"{r['vp_cnn_score']:>7.2f}{bvs} {r['vp_pri_score']:>7.2f} {r['vp_uni_score']:>7.2f} | "
+                  f"{r['vp_cnn_wkl']:>10.5f}{bvwk} {r['vp_pri_wkl']:>10.5f} {r['vp_uni_wkl']:>10.5f}")
         if len(vp_results) > 1:
             avg_vp_cnn = np.mean([r["vp_cnn_score"] for r in vp_results])
             avg_vp_pri = np.mean([r["vp_pri_score"] for r in vp_results])
@@ -376,10 +453,19 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
             avg_vp_pri_wkl = np.mean([r["vp_pri_wkl"] for r in vp_results])
             avg_vp_uni_wkl = np.mean([r["vp_uni_wkl"] for r in vp_results])
             avg_vp_pix = np.mean([r["vp_pixels"] for r in vp_results])
-            print("  " + "-" * 82)
+            vp_bln_sub = [r for r in vp_results if r["vp_bln_score"] is not None]
+            if vp_bln_sub:
+                avg_vp_bln = np.mean([r["vp_bln_score"] for r in vp_bln_sub])
+                avg_vp_bln_wkl = np.mean([r["vp_bln_wkl"] for r in vp_bln_sub])
+                bva_s = f" {avg_vp_bln:>7.2f}"
+                bva_w = f" {avg_vp_bln_wkl:>10.5f}"
+            else:
+                bva_s = (" " + "    n/a") if has_vp_blend else ""
+                bva_w = (" " + "       n/a") if has_vp_blend else ""
+            print("  " + "-" * vp_sep)
             print(f"  {'AVG':>10} | {avg_vp_pix:>6.0f} | "
-                  f"{avg_vp_cnn:>7.2f} {avg_vp_pri:>7.2f} {avg_vp_uni:>7.2f} | "
-                  f"{avg_vp_cnn_wkl:>10.5f} {avg_vp_pri_wkl:>10.5f} {avg_vp_uni_wkl:>10.5f}")
+                  f"{avg_vp_cnn:>7.2f}{bva_s} {avg_vp_pri:>7.2f} {avg_vp_uni:>7.2f} | "
+                  f"{avg_vp_cnn_wkl:>10.5f}{bva_w} {avg_vp_pri_wkl:>10.5f} {avg_vp_uni_wkl:>10.5f}")
 
     # Per-class breakdown
     print(f"\n  Per-class KL (CNN, val quadrant, averaged across seeds):")

@@ -479,14 +479,19 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
     return observations
 
 
-def _save_observations(observations, round_id):
+def _save_observations(observations, round_id, round_number=None):
     """Save observations to disk so they can be reused for offline training."""
     if not observations:
         return
     os.makedirs(DATA_DIR, exist_ok=True)
     path = os.path.join(DATA_DIR, f"observations_{round_id[:8]}.json")
+    payload = {
+        "round_id": round_id,
+        "round_number": round_number,
+        "observations": observations,
+    }
     with open(path, "w") as f:
-        json.dump(observations, f)
+        json.dump(payload, f)
     print(f"  Saved {len(observations)} observations to {path}")
 
 
@@ -781,6 +786,77 @@ def predict_full_map(model, features, width, height):
     return probs
 
 
+# --- Bayesian Blending ---
+
+def bayesian_blend(cnn_pred, observations, initial_grid, width, height,
+                   strength=5.0):
+    """
+    Blend CNN predictions with empirical observation counts.
+
+    For observed pixels:
+        posterior[c] ∝ strength * cnn_pred[c] + obs_count[c]
+    For unobserved pixels:
+        prediction unchanged (CNN only).
+
+    Args:
+        cnn_pred: (H, W, 6) CNN probability predictions
+        observations: list of {"seed_index": int, "viewport": {...}, "grid": [[...]]}
+                      filtered to a single seed
+        initial_grid: the initial terrain grid for this seed
+        width, height: map dimensions
+        strength: pseudo-count weight for CNN prior (higher = trust CNN more)
+
+    Returns:
+        (H, W, 6) blended probability predictions
+    """
+    # Build empirical counts per pixel from observations
+    obs_counts = np.zeros((height, width, NUM_CLASSES), dtype=np.float32)
+    obs_hits = np.zeros((height, width), dtype=np.float32)
+
+    mapping = {10: 0, 11: 0, 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
+
+    for obs in observations:
+        vp = obs["viewport"]
+        vx, vy = vp["x"], vp["y"]
+        obs_grid = obs["grid"]
+        for dy in range(len(obs_grid)):
+            for dx in range(len(obs_grid[0])):
+                gy, gx = vy + dy, vx + dx
+                if 0 <= gy < height and 0 <= gx < width:
+                    cls = mapping.get(obs_grid[dy][dx], 0)
+                    obs_counts[gy, gx, cls] += 1.0
+                    obs_hits[gy, gx] += 1.0
+
+    # Blend: for observed pixels where CNN is uncertain, compute posterior
+    blended = cnn_pred.copy()
+    observed_mask = obs_hits > 0
+
+    if observed_mask.any():
+        # Compute per-pixel entropy of CNN predictions (nat)
+        p = cnn_pred[observed_mask]                          # (P, 6)
+        cnn_entropy = -np.sum(p * np.log(np.maximum(p, 1e-12)), axis=-1)  # (P,)
+        max_entropy = np.log(NUM_CLASSES)                    # ln(6) ≈ 1.79
+        # Only blend pixels where CNN entropy exceeds threshold
+        entropy_thresh = 0.3 * max_entropy                   # ~0.54 nat
+        uncertain = cnn_entropy > entropy_thresh             # (P,) bool
+
+        if uncertain.any():
+            prior_counts = strength * p[uncertain]           # (U, 6)
+            empirical = obs_counts[observed_mask][uncertain]  # (U, 6)
+            posterior = prior_counts + empirical
+            posterior = np.maximum(posterior, 1e-8)
+            posterior = posterior / posterior.sum(axis=-1, keepdims=True)
+            posterior = np.maximum(posterior, PROB_FLOOR)
+            posterior = posterior / posterior.sum(axis=-1, keepdims=True)
+            # Write back only the uncertain observed pixels
+            idx = np.where(observed_mask)
+            uy = idx[0][uncertain]
+            ux = idx[1][uncertain]
+            blended[uy, ux] = posterior
+
+    return blended
+
+
 # --- Fallback ---
 
 def build_prior_prediction(initial_grid, width, height):
@@ -826,9 +902,23 @@ def submit_fallback(round_id, seeds_count, initial_states, width, height):
 
 
 def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
-                           seeds_count, width, height):
-    """Submit CNN-based predictions for all seeds (overwrites fallback)."""
-    print("\n--- Submitting CNN predictions ---")
+                           seeds_count, width, height,
+                           observations=None):
+    """Submit CNN-based predictions for all seeds (overwrites fallback).
+
+    If observations are provided, applies Bayesian blending to combine
+    CNN predictions with empirical observation data before submitting.
+    """
+    label = "blended CNN+obs" if observations else "CNN"
+    print(f"\n--- Submitting {label} predictions ---")
+
+    # Group observations by seed for blending
+    if observations:
+        obs_by_seed = {}
+        for obs in observations:
+            sid = obs["seed_index"]
+            obs_by_seed.setdefault(sid, []).append(obs)
+
     for seed_idx in range(seeds_count):
         if past_deadline():
             print(f"  Deadline reached at seed {seed_idx}, keeping fallback for remaining seeds")
@@ -839,6 +929,13 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
             )
         features = encoded_grids[seed_idx]
         prediction = predict_full_map(model, features, width, height)
+
+        # Bayesian blend if we have observations for this seed
+        if observations and seed_idx in obs_by_seed:
+            prediction = bayesian_blend(
+                prediction, obs_by_seed[seed_idx],
+                initial_states[seed_idx]["grid"], width, height,
+            )
 
         try:
             result = submit_prediction(round_id, seed_idx, prediction)
@@ -909,6 +1006,7 @@ def main():
 
         if model is not None:
             # Pretrained model found — use it directly for predictions
+            # If we have observations, blend them with CNN predictions
             print(f"\n--- Submitting pretrained CNN predictions ---")
             encoded_grids = {}
             for seed_idx in range(seeds_count):
@@ -917,7 +1015,8 @@ def main():
                 )
             submit_cnn_predictions(
                 round_id, model, encoded_grids, initial_states,
-                seeds_count, width, height
+                seeds_count, width, height,
+                observations=observations if observations else None,
             )
         else:
             # No checkpoint — train from observations collected above
