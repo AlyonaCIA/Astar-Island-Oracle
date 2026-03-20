@@ -261,7 +261,7 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
 
         # --- CNN prediction ---
         with torch.no_grad():
-            if arch == "unet_obs":
+            if arch in ("unet_obs", "unet_sim"):
                 obs_feat = encode_obs_channels(seed_obs or [], width, height)
                 x = np.concatenate([features, obs_feat], axis=0)  # (21, H, W)
             else:

@@ -453,6 +453,8 @@ MODEL_REGISTRY = {
     "unet_v2": lambda **kw: MiniUNetV2(
         dropout=kw.get('dropout', 0.1),
         in_channels=14 + OBS_CHANNELS + XSEED_OBS_CHANNELS),
+    "unet_sim": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1),
+                                       in_channels=14 + OBS_CHANNELS),
 }
 
 CHECKPOINT_DIR_MAP = {
@@ -462,6 +464,7 @@ CHECKPOINT_DIR_MAP = {
     "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
     "unet_obs": os.path.join(SCRIPT_DIR, "checkpoints_unet_obs"),
     "unet_v2": os.path.join(SCRIPT_DIR, "checkpoints_unet_v2"),
+    "unet_sim": os.path.join(SCRIPT_DIR, "checkpoints_unet_sim"),
 }
 
 MODEL_ARCH = os.environ.get("ASTAR_MODEL", "quick")
@@ -1344,7 +1347,7 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
     For unet_obs/unet_v2 architectures, observations are encoded as input channels.
     If ensemble_models is provided, uses snapshot ensemble averaging.
     """
-    is_obs_model = arch in ("unet_obs", "unet_v2")
+    is_obs_model = arch in ("unet_obs", "unet_v2", "unet_sim")
     is_v2 = (arch == "unet_v2")
     use_ensemble = ensemble_models and len(ensemble_models) > 1
 

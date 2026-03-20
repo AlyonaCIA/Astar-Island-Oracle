@@ -476,6 +476,7 @@ MODEL_REGISTRY = {
     "unet_obs": functools.partial(MiniUNet, dropout=0.1, in_channels=14 + OBS_CHANNELS),
     "unet_v2": functools.partial(MiniUNetV2, dropout=0.1,
                                   in_channels=14 + OBS_CHANNELS + XSEED_OBS_CHANNELS),
+    "unet_sim": functools.partial(MiniUNet, dropout=0.1, in_channels=14 + OBS_CHANNELS),
 }
 
 # Separate checkpoint dirs per architecture
@@ -486,6 +487,7 @@ CHECKPOINT_DIR_MAP = {
     "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
     "unet_obs": os.path.join(SCRIPT_DIR, "checkpoints_unet_obs"),
     "unet_v2": os.path.join(SCRIPT_DIR, "checkpoints_unet_v2"),
+    "unet_sim": os.path.join(SCRIPT_DIR, "checkpoints_unet_sim"),
 }
 
 
@@ -661,6 +663,7 @@ def augment_maps(features_list, targets_list, meta):
 # ---------------------------------------------------------------------------
 
 OBS_DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+REPLAY_DIR = os.path.join(SCRIPT_DIR, "simulation_replays")
 _TERRAIN_TO_CLASS = {10: 0, 11: 0, 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
 
 
@@ -779,6 +782,163 @@ def _encode_cross_seed_obs(all_obs, current_seed, width, height):
     """Encode observations from OTHER seeds into 7 channels."""
     other_obs = [o for o in all_obs if o.get("seed_index") != current_seed]
     return encode_obs_channels(other_obs, width, height)
+
+
+# ---------------------------------------------------------------------------
+# Simulation replay loading & synthetic observation sampling for unet_sim
+# ---------------------------------------------------------------------------
+
+def load_replay_final_grids():
+    """
+    Load the final-step (year 50) grid from each simulation replay.
+    Returns dict: (round_id_short, seed_index) -> 2D grid array.
+    """
+    if not os.path.isdir(REPLAY_DIR):
+        print(f"  No replay directory found at {REPLAY_DIR}")
+        return {}
+
+    grids = {}
+    for fname in sorted(os.listdir(REPLAY_DIR)):
+        if not fname.endswith('.json'):
+            continue
+        path = os.path.join(REPLAY_DIR, fname)
+        with open(path) as f:
+            data = json.load(f)
+        round_id_short = data['round_id'][:8]
+        seed_index = data['seed_index']
+        final_grid = data['frames'][-1]['grid']
+        grids[(round_id_short, seed_index)] = final_grid
+
+    print(f"  Loaded {len(grids)} replay final grids from {REPLAY_DIR}")
+    return grids
+
+
+def sample_synthetic_obs_channels(final_grid, width, height,
+                                   n_viewports=None, vp_size=15):
+    """
+    Sample random viewports from a simulation replay's final grid and encode
+    them as observation channels (7, H, W).
+
+    Same format as encode_obs_channels:
+        Channels 0-5: observed class frequency at each pixel
+        Channel 6:    log(1 + observation_count) coverage indicator
+
+    This simulates what happens during a live round: each viewport query
+    reveals one stochastic realization of the simulation outcome.
+    """
+    if n_viewports is None:
+        n_viewports = random.randint(6, 12)
+
+    obs_counts = np.zeros((NUM_CLASSES, height, width), dtype=np.float32)
+    obs_hits = np.zeros((height, width), dtype=np.float32)
+
+    for _ in range(n_viewports):
+        vx = random.randint(0, max(0, width - vp_size))
+        vy = random.randint(0, max(0, height - vp_size))
+        vw = min(vp_size, width - vx)
+        vh = min(vp_size, height - vy)
+
+        for dy in range(vh):
+            for dx in range(vw):
+                gy, gx = vy + dy, vx + dx
+                cls = _TERRAIN_TO_CLASS.get(final_grid[gy][gx], 0)
+                obs_counts[cls, gy, gx] += 1.0
+                obs_hits[gy, gx] += 1.0
+
+    # Normalize counts to frequencies where observed
+    mask = obs_hits > 0
+    for c in range(NUM_CLASSES):
+        obs_counts[c][mask] /= obs_hits[mask]
+
+    coverage = np.log1p(obs_hits)[np.newaxis, :, :]
+    return np.concatenate([obs_counts, coverage], axis=0)  # (7, H, W)
+
+
+def build_fullmap_datasets_sim(all_data, val_quadrant=3, copies_per_map=3):
+    """
+    Build full-map datasets with synthetic observation channels sampled
+    from simulation replay final frames (year 50).
+
+    For each ground truth sample with a matching replay:
+    - Creates `copies_per_map` copies, each with different random viewports
+      (6-12 viewports of 15x15, mimicking real query budget of ~10/seed)
+
+    ALL samples (with and without replay) also get one copy with zero
+    observations to teach the model terrain-only fallback.
+
+    Features: 21 channels = 14 terrain + 7 synthetic observations
+    Targets: 6-channel ground truth probability distribution
+
+    Returns same structure as build_fullmap_datasets.
+    """
+    replay_grids = load_replay_final_grids()
+
+    features_list, targets_list = [], []
+    train_masks, val_masks = [], []
+    meta = []
+
+    n_with_replay = 0
+    n_without_replay = 0
+
+    for data in all_data:
+        initial_grid = data.get("initial_grid")
+        ground_truth = data.get("ground_truth")
+        if initial_grid is None or ground_truth is None:
+            continue
+
+        width = data["width"]
+        height = data["height"]
+        seed_idx = data.get("_seed_index", 0)
+        round_id = data.get("_round_id", "")
+        round_id_short = round_id[:8] if round_id else ""
+
+        terrain_feat = encode_initial_grid(initial_grid, width, height)  # (14, H, W)
+        gt = np.array(ground_truth, dtype=np.float32).transpose(2, 0, 1)  # (6, H, W)
+        tmask, vmask = quadrant_masks(height, width, val_quadrant)
+
+        replay_grid = replay_grids.get((round_id_short, seed_idx))
+
+        if replay_grid is not None:
+            n_with_replay += 1
+            # Create copies with different random viewport samples
+            for copy_i in range(copies_per_map):
+                obs_feat = sample_synthetic_obs_channels(
+                    replay_grid, width, height)  # random 6-12 viewports
+                features = np.concatenate([terrain_feat, obs_feat], axis=0)
+
+                features_list.append(features)
+                targets_list.append(gt)
+                train_masks.append(tmask)
+                val_masks.append(vmask)
+                meta.append({
+                    "round": data.get("_round_number"),
+                    "seed": seed_idx,
+                    "score": data.get("score"),
+                    "has_obs": True,
+                    "n_obs": copy_i,
+                })
+        else:
+            n_without_replay += 1
+
+        # Always include one copy with zero observations (terrain-only fallback)
+        zero_obs = np.zeros((OBS_CHANNELS, height, width), dtype=np.float32)
+        features = np.concatenate([terrain_feat, zero_obs], axis=0)
+        features_list.append(features)
+        targets_list.append(gt)
+        train_masks.append(tmask)
+        val_masks.append(vmask)
+        meta.append({
+            "round": data.get("_round_number"),
+            "seed": seed_idx,
+            "score": data.get("score"),
+            "has_obs": False,
+            "n_obs": 0,
+        })
+
+    print(f"  Full maps: {len(features_list)} total "
+          f"({n_with_replay} with replay x {copies_per_map} copies + "
+          f"{n_with_replay + n_without_replay} zero-obs fallbacks)")
+    return features_list, targets_list, train_masks, val_masks, meta
 
 
 def build_fullmap_datasets_v2(all_data, val_quadrant=3):
@@ -964,7 +1124,10 @@ def train(all_data, reset=False, forever=False, arch="quick", cv="quadrant"):
     print(f"{'='*60}")
 
     # Build datasets — choose encoding based on architecture
-    if arch == "unet_v2":
+    if arch == "unet_sim":
+        features_list, targets_list, _, _, meta = \
+            build_fullmap_datasets_sim(all_data, val_quadrant=0)
+    elif arch == "unet_v2":
         features_list, targets_list, _, _, meta = \
             build_fullmap_datasets_v2(all_data, val_quadrant=0)
     elif arch == "unet_obs":
@@ -979,7 +1142,7 @@ def train(all_data, reset=False, forever=False, arch="quick", cv="quadrant"):
         return
 
     # Apply rotation/flip augmentation for augmented architectures
-    if arch in ("unet_aug", "unet_obs", "unet_v2"):
+    if arch in ("unet_aug", "unet_obs", "unet_v2", "unet_sim"):
         features_list, targets_list, meta = augment_maps(
             features_list, targets_list, meta)
 
@@ -991,7 +1154,7 @@ def train(all_data, reset=False, forever=False, arch="quick", cv="quadrant"):
 
     # Pre-build (H, W) masks for all 4 folds
     # --- Build cross-validation folds ---
-    use_obs_dropout = arch in ("unet_obs", "unet_v2")
+    use_obs_dropout = arch in ("unet_obs", "unet_v2", "unet_sim")
     obs_ch_start = 14  # observation channels start at index 14
 
     if cv == "round":
