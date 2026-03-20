@@ -345,6 +345,7 @@ MODEL_REGISTRY = {
     "quick": QuickCNN,
     "quick3": QuickCNN3,
     "unet": MiniUNet,
+    "unet_aug": MiniUNet,  # same architecture, trained with augmented data
 }
 
 # Separate checkpoint dirs per architecture
@@ -352,6 +353,7 @@ CHECKPOINT_DIR_MAP = {
     "quick": os.path.join(SCRIPT_DIR, "checkpoints"),
     "quick3": os.path.join(SCRIPT_DIR, "checkpoints_quick3"),
     "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
+    "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
 }
 
 
@@ -497,6 +499,31 @@ def build_fullmap_datasets(all_data, val_quadrant=3):
     return features_list, targets_list, train_masks, val_masks, meta
 
 
+def augment_maps(features_list, targets_list, meta):
+    """
+    Augment full-map tensors with rotations (90°, 180°, 270°) and horizontal
+    flips.  Each original map produces 8 variants (4 rotations × 2 flip states).
+
+    Input/output shapes per element: features (14, H, W), targets (6, H, W).
+    np.rot90 operates on the last two axes.
+    """
+    aug_features, aug_targets, aug_meta = [], [], []
+    for feat, tgt, m in zip(features_list, targets_list, meta):
+        for k in range(4):  # 0°, 90°, 180°, 270°
+            rf = np.rot90(feat, k=k, axes=(1, 2)).copy()
+            rt = np.rot90(tgt, k=k, axes=(1, 2)).copy()
+            aug_features.append(rf)
+            aug_targets.append(rt)
+            aug_meta.append({**m, "aug": f"rot{k*90}"})
+            # horizontal flip
+            aug_features.append(np.flip(rf, axis=2).copy())
+            aug_targets.append(np.flip(rt, axis=2).copy())
+            aug_meta.append({**m, "aug": f"rot{k*90}_fliph"})
+    print(f"  Augmented: {len(features_list)} → {len(aug_features)} maps "
+          f"(4 rotations × 2 flip states)")
+    return aug_features, aug_targets, aug_meta
+
+
 # ---------------------------------------------------------------------------
 # Loss: KL divergence (same metric used for scoring)
 # ---------------------------------------------------------------------------
@@ -616,6 +643,11 @@ def train(all_data, reset=False, forever=False, arch="quick"):
     if not features_list:
         print("ERROR: No usable data found.")
         return
+
+    # Apply rotation/flip augmentation for unet_aug
+    if arch == "unet_aug":
+        features_list, targets_list, meta = augment_maps(
+            features_list, targets_list, meta)
 
     # Convert to tensors
     X = torch.tensor(np.stack(features_list)).to(DEVICE)       # (N, 14, H, W)

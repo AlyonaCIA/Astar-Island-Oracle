@@ -32,7 +32,7 @@ from train_cnn import (
     quadrant_masks, load_local_data, fetch_ground_truth,
     load_checkpoint, load_model_from_checkpoint,
     make_model, get_checkpoint_dir, latest_checkpoint,
-    build_fullmap_datasets, kl_divergence_loss,
+    build_fullmap_datasets, augment_maps, kl_divergence_loss,
     save_checkpoint, _clear_checkpoints,
     MODEL_REGISTRY,
     DEVICE, NUM_CLASSES, PROB_FLOOR, VAL_QUADRANT,
@@ -111,6 +111,11 @@ def train_single_model(arch, all_data, epochs, lr, batch_size, reset=False):
     if not features_list:
         print("  ERROR: No usable data.")
         return None
+
+    # Apply rotation/flip augmentation for unet_aug
+    if arch == "unet_aug":
+        features_list, targets_list, meta = augment_maps(
+            features_list, targets_list, meta)
 
     X = torch.tensor(np.stack(features_list)).to(DEVICE)
     Y = torch.tensor(np.stack(targets_list)).to(DEVICE)

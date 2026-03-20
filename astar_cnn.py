@@ -310,12 +310,14 @@ MODEL_REGISTRY = {
     "quick": QuickCNN,
     "quick3": QuickCNN3,
     "unet": MiniUNet,
+    "unet_aug": MiniUNet,  # same architecture, trained with augmented data
 }
 
 CHECKPOINT_DIR_MAP = {
     "quick": os.path.join(SCRIPT_DIR, "checkpoints"),
     "quick3": os.path.join(SCRIPT_DIR, "checkpoints_quick3"),
     "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
+    "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
 }
 
 MODEL_ARCH = os.environ.get("ASTAR_MODEL", "quick")
