@@ -563,46 +563,65 @@ def aggregate_observations(observations, height, width):
     return obs_probs, obs_total
 
 
-def score_rollouts(trajectories, obs_probs, obs_total, eps=1e-6):
+# Static terrain codes that never change — scoring these just adds noise
+_STATIC_CODES = {CODE_TO_IDX[10], CODE_TO_IDX[11], CODE_TO_IDX[5]}  # ocean, plains, mountain
+
+
+def score_rollouts(trajectories, obs_probs, obs_total, initial_grid_indices,
+                   eps=1e-6):
     """
     Score each rollout against viewport observations.
 
-    Observations are from the final timestep. For each observed cell,
-    check the rollout's predicted class at the final step and look up
-    the empirical probability of that class in the observations.
+    Only scores DYNAMIC cells (not ocean/plains/mountain) since static cells
+    match trivially and just push all log-likelihoods in the same direction
+    without differentiating rollouts.
+
+    Log-weights are normalized by the number of scored cells so the scale
+    doesn't depend on viewport coverage, preventing ESS collapse.
 
     Args:
         trajectories: (K, T+1, H, W) int64 — class indices
         obs_probs: (H, W, 8) float — empirical class probabilities at final step
         obs_total: (H, W) float — observation counts (>0 means observed)
+        initial_grid_indices: (H, W) int64 — initial terrain class indices
         eps: small constant for numerical stability
 
     Returns:
-        log_weights: (K,) float64 array of log-likelihood scores
+        log_weights: (K,) float64 array of normalized log-likelihood scores
     """
     K = trajectories.shape[0]
-    T = trajectories.shape[1] - 1  # last index is final state
+    T = trajectories.shape[1] - 1
 
-    # Observed cell mask
+    # Only score observed AND dynamic cells
     observed = obs_total > 0  # (H, W)
-    obs_ys, obs_xs = np.where(observed)
+    dynamic = np.ones_like(observed)
+    for static_idx in _STATIC_CODES:
+        dynamic &= (initial_grid_indices != static_idx)
+    score_mask = observed & dynamic
+    obs_ys, obs_xs = np.where(score_mask)
+    n_scored = len(obs_ys)
 
-    if len(obs_ys) == 0:
-        # No observations — uniform weights
+    if n_scored == 0:
         return np.zeros(K, dtype=np.float64)
 
     # Final states for all rollouts: (K, H, W)
     final_states = trajectories[:, T, :, :]
 
-    # For each rollout, sum log P(observed class)
+    # Vectorized scoring: gather obs_probs for each rollout's predicted class
+    # final_classes shape: (K, n_scored)
+    final_classes = final_states[:, obs_ys, obs_xs]  # (K, n_scored)
+
+    # obs_probs at scored cells: (n_scored, 8)
+    scored_obs_probs = obs_probs[obs_ys, obs_xs, :]  # (n_scored, 8)
+
+    # For each rollout, look up the probability of its predicted class
     log_weights = np.zeros(K, dtype=np.float64)
     for k in range(K):
-        log_w = 0.0
-        for oy, ox in zip(obs_ys, obs_xs):
-            c = final_states[k, oy, ox]
-            p = obs_probs[oy, ox, c]
-            log_w += math.log(p + eps)
-        log_weights[k] = log_w
+        probs_k = scored_obs_probs[np.arange(n_scored), final_classes[k]]  # (n_scored,)
+        log_weights[k] = np.log(probs_k + eps).sum()
+
+    # Normalize by number of scored cells to keep scale independent of coverage
+    log_weights /= n_scored
 
     return log_weights
 
@@ -699,9 +718,15 @@ def predict_round(model, initial_grid, height, width, observations,
         print(f"    Scoring against {len(observations)} viewport observations...")
         obs_probs, obs_total = aggregate_observations(observations, height, width)
         n_observed = int((obs_total > 0).sum())
-        print(f"    Observed cells: {n_observed}/{height*width}")
+        initial_indices = grid_to_class_indices(initial_grid, height, width)
+        n_dynamic = int(np.sum(
+            np.all([initial_indices != s for s in _STATIC_CODES], axis=0)
+            & (obs_total > 0)))
+        print(f"    Observed cells: {n_observed}/{height*width} "
+              f"(dynamic: {n_dynamic})")
 
-        log_weights = score_rollouts(trajectories, obs_probs, obs_total)
+        log_weights = score_rollouts(trajectories, obs_probs, obs_total,
+                                     initial_indices)
         weights = normalize_weights(log_weights)
 
         # Effective sample size (diagnostic)
@@ -801,15 +826,23 @@ def evaluate_mc(replays, gt_data, K=DEFAULT_K_ROLLOUTS, T=DEFAULT_T_STEPS,
         loader = DataLoader(dataset, batch_size=DEFAULT_BATCH, shuffle=True)
 
         # Train
+        t_start = time.time()
         for epoch in range(1, train_epochs + 1):
             model.train()
+            epoch_loss = 0.0
+            n_b = 0
             for X_b, Y_b in loader:
                 optimizer.zero_grad()
                 loss = loss_fn(model(X_b), Y_b)
                 loss.backward()
                 optimizer.step()
-            if epoch % 50 == 0:
-                print(f"    Epoch {epoch}/{train_epochs}")
+                epoch_loss += loss.item()
+                n_b += 1
+            avg_loss = epoch_loss / max(n_b, 1)
+            if epoch == 1 or epoch % 25 == 0 or epoch == train_epochs:
+                elapsed = time.time() - t_start
+                print(f"    Epoch {epoch:4d}/{train_epochs} | "
+                      f"loss={avg_loss:.6f} | {elapsed:.0f}s")
 
         # Evaluate on held-out round's GT samples
         val_gts = gt_by_round[val_rid]
