@@ -481,21 +481,20 @@ def make_model(arch="quick", **kwargs):
 
 def collect_observations(round_id, seeds_count, initial_states, width, height):
     """
-    Three-phase viewport query strategy with cross-seed intelligence sharing.
+    Two-phase viewport query strategy: guaranteed coverage + smart resampling.
 
-    Phase 1 — SCOUT (5 queries):
-        Query the single most dynamic viewport on each seed.
-        Establishes baseline dynamism and provides cross-seed intelligence.
+    Phase 1 — FULL COVERAGE (systematic grid, priority-ordered):
+        Use the systematic tile grid (e.g. 3×3 = 9 tiles for 40×40 maps)
+        to guarantee 100% map coverage on every seed.  Tiles are queried in
+        interest-priority order: most dynamic first, so if budget runs out
+        only the least informative (static) corners are missed.
+        After the first tile per seed, cross-seed intelligence is used to
+        re-rank remaining tiles.
 
-    Phase 2 — FULL COVERAGE (greedy ordering, ~8-9 viewports/seed):
-        Place greedy entropy-weighted viewports until the entire map is
-        covered for each seed. Orders the most important areas first, so
-        if budget runs short the least dynamic corners are the ones missed.
-        Cross-seed intelligence boosts viewports near observed dynamic areas.
-
-    Phase 3 — RESAMPLE (remaining budget):
+    Phase 2 — SMART RESAMPLE (remaining budget):
         Re-query the most dynamic observed viewports across all seeds.
-        Multiple observations per cell → better distribution estimates.
+        Multiple observations per cell → better distribution estimates
+        (each query runs a fresh stochastic simulation).
     """
     budget = check_budget()
     if not budget:
@@ -541,84 +540,94 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
                 return True  # treat rate limit as budget stop
             raise
 
-    # ── Phase 1: SCOUT — one query per seed on the most interesting viewport ──
-    print(f"  Strategy: 3-phase (scout → full coverage → resample), budget {remaining}")
-    print(f"  Phase 1: SCOUT ({seeds_count} queries)")
+    # ── Compute systematic tile grid for guaranteed 100% coverage ──
+    coverage_tiles = compute_tile_grid(width, height)
+    tiles_per_seed = len(coverage_tiles)
+    total_coverage_queries = tiles_per_seed * seeds_count
 
+    # Score each tile per seed by interest (terrain dynamism)
+    seed_tile_order = []
+    for s in range(seeds_count):
+        scored = [
+            (score_tile(initial_states[s]["grid"], tile, width, height), i, tile)
+            for i, tile in enumerate(coverage_tiles)
+        ]
+        scored.sort(reverse=True)  # most interesting first
+        seed_tile_order.append([(tile, orig_idx) for _, orig_idx, tile in scored])
+
+    print(f"  Strategy: 2-phase (full coverage → smart resample), budget {remaining}")
+    print(f"  Phase 1: FULL COVERAGE ({tiles_per_seed} tiles/seed × {seeds_count} seeds "
+          f"= {total_coverage_queries} queries for 100% coverage)")
+
+    # ── Phase 1: FULL COVERAGE — systematic grid, priority-ordered ──
+    # Round-robin across seeds: query tile 0 (highest priority) on each seed,
+    # then tile 1, etc.  After the first tile per seed completes, use cross-seed
+    # intelligence to re-rank the remaining tiles.
+    seed_tile_idx = [0] * seeds_count  # next tile index per seed
+
+    # First tile per seed (scout pass — establishes cross-seed intelligence)
     for s in range(seeds_count):
         if queries_done >= query_limit or past_deadline():
             break
-        # Pick the single best greedy viewport for this seed
-        scout_vps = compute_greedy_viewports(
-            seed_interest[s], width, height, n_viewports=1
-        )
-        if scout_vps:
-            tx, ty, tw, th = scout_vps[0]
-            exhausted = _do_query(s, tx, ty, tw, th, "Scout")
-            if exhausted:
-                _save_observations(observations, round_id)
-                return observations
+        tile, _ = seed_tile_order[s][0]
+        tx, ty, tw, th = tile
+        exhausted = _do_query(s, tx, ty, tw, th, "Cover 1 (scout)")
+        if exhausted:
+            _save_observations(observations, round_id)
+            return observations
+        seed_tile_idx[s] = 1
 
-    # ── Cross-seed intelligence: build dynamism heatmap from scout results ──
-    # Since all seeds share hidden parameters, observed dynamism on any seed
-    # predicts dynamism at similar positions on other seeds.
+    # Cross-seed intelligence: build dynamism heatmap from first-tile results
     cross_seed_dynamism = np.zeros((height, width), dtype=np.float32)
     for s in range(seeds_count):
         grid = initial_states[s]["grid"]
         dyn = build_observed_dynamism_heatmap(seed_obs[s], grid, width, height)
         cross_seed_dynamism += dyn
 
-    # Boost interest heatmaps with cross-seed dynamism
-    boosted_interest = []
-    for s in range(seeds_count):
-        boosted = seed_interest[s].copy()
-        # Add dynamism signal (soft: scale by 2.0 to make it influential)
-        if cross_seed_dynamism.sum() > 0:
-            boosted += 2.0 * cross_seed_dynamism / max(cross_seed_dynamism.max(), 1.0)
-        # Zero out already-queried areas for this seed
-        for obs in seed_obs[s]:
-            vp = obs["viewport"]
-            boosted[vp["y"]:vp["y"]+vp["h"], vp["x"]:vp["x"]+vp["w"]] = 0
-        boosted_interest.append(boosted)
-
-    # ── Phase 2: DYNAMIC COVERAGE — greedy viewports on non-static areas ──
-    # Skip static tiles (mostly ocean/mountain) since they don't contribute
-    # to scoring. Reserve ≥40% of remaining budget for Phase 3 resampling
-    # to build better empirical distributions on dynamic cells.
-    remaining_after_scout = query_limit - queries_done
-    min_resample = max(seeds_count, int(0.4 * remaining_after_scout))
-    coverage_limit = remaining_after_scout - min_resample
-
-    # Compute greedy viewports per seed — min_score=15 skips static-heavy tiles
-    max_vps_needed = max(1, (width * height) // (15 * 15) + 2)
-    seed_coverage_vps = []
-    for s in range(seeds_count):
-        vps = compute_greedy_viewports(
-            boosted_interest[s], width, height,
-            n_viewports=max_vps_needed, min_spacing=3,
-            min_score=15.0
-        )
-        seed_coverage_vps.append(vps)
-
-    n_coverage_vps = max(len(vps) for vps in seed_coverage_vps) if seed_coverage_vps else 0
-    print(f"  Phase 2: DYNAMIC COVERAGE (up to {n_coverage_vps} viewports/seed, "
-          f"budget for coverage: {coverage_limit}, reserved for resample: {min_resample})")
-
-    # Round-robin across seeds for fair coverage
-    for vp_idx in range(n_coverage_vps):
+    # Re-rank remaining tiles per seed using boosted interest
+    if cross_seed_dynamism.sum() > 0:
         for s in range(seeds_count):
-            if queries_done >= query_limit - min_resample or past_deadline():
-                break
-            if vp_idx >= len(seed_coverage_vps[s]):
+            remaining_tiles = seed_tile_order[s][seed_tile_idx[s]:]
+            if not remaining_tiles:
                 continue
-            tx, ty, tw, th = seed_coverage_vps[s][vp_idx]
-            exhausted = _do_query(s, tx, ty, tw, th, f"Cover {vp_idx+2}")
+            boosted = seed_interest[s].copy()
+            boosted += 2.0 * cross_seed_dynamism / max(cross_seed_dynamism.max(), 1.0)
+            rescored = []
+            for tile, orig_idx in remaining_tiles:
+                tx, ty, tw, th = tile
+                tile_score = boosted[ty:ty+th, tx:tx+tw].sum()
+                rescored.append((tile_score, tile, orig_idx))
+            rescored.sort(reverse=True)
+            seed_tile_order[s][seed_tile_idx[s]:] = [
+                (tile, orig_idx) for _, tile, orig_idx in rescored
+            ]
+
+    # Continue coverage: round-robin remaining tiles across seeds
+    max_tile_idx = tiles_per_seed
+    for tile_round in range(1, max_tile_idx):
+        for s in range(seeds_count):
+            if queries_done >= query_limit or past_deadline():
+                break
+            if seed_tile_idx[s] >= tiles_per_seed:
+                continue
+            tile, _ = seed_tile_order[s][seed_tile_idx[s]]
+            tx, ty, tw, th = tile
+            exhausted = _do_query(s, tx, ty, tw, th, f"Cover {tile_round+1}")
             if exhausted:
                 _save_observations(observations, round_id)
                 return observations
-        # Check budget after each full round
-        if queries_done >= query_limit - min_resample:
+            seed_tile_idx[s] += 1
+        if queries_done >= query_limit or past_deadline():
             break
+
+    # Report coverage
+    for s in range(seeds_count):
+        covered = np.zeros((height, width), dtype=bool)
+        for obs in seed_obs[s]:
+            vp = obs["viewport"]
+            covered[vp["y"]:vp["y"]+vp["h"], vp["x"]:vp["x"]+vp["w"]] = True
+        pct = covered.sum() / (width * height) * 100
+        print(f"  Seed {s}: {len(seed_obs[s])} queries, {pct:.0f}% coverage")
 
     # ── Update cross-seed dynamism after coverage phase ──
     cross_seed_dynamism = np.zeros((height, width), dtype=np.float32)
@@ -627,10 +636,10 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
         dyn = build_observed_dynamism_heatmap(seed_obs[s], grid, width, height)
         cross_seed_dynamism += dyn
 
-    # ── Phase 3: RESAMPLE — re-query most dynamic observed viewports ──
+    # ── Phase 2: SMART RESAMPLE — re-query most dynamic observed viewports ──
     resample_budget = query_limit - queries_done
     if resample_budget > 0 and not past_deadline():
-        print(f"  Phase 3: RESAMPLE ({resample_budget} queries on most dynamic viewports)")
+        print(f"  Phase 2: SMART RESAMPLE ({resample_budget} queries on most dynamic viewports)")
 
         # Rank all observed viewports by change rate
         resample_candidates = []  # (change_rate, seed, viewport_xywh)
