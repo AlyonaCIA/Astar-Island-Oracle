@@ -190,33 +190,67 @@ def submit_prediction(round_id, seed_index, prediction):
     return resp.json()
 
 
+def compute_tile_grid(width, height, max_tile=15):
+    """
+    Non-overlapping tile partition covering the entire map.
+    For a 40x40 map: 9 tiles (3x3) at x=[0,15,30], y=[0,15,30].
+    Returns list of (x, y, w, h) tuples.
+    """
+    x_specs = []
+    x = 0
+    while x < width:
+        w = min(max_tile, width - x)
+        x_specs.append((x, w))
+        x += w
+    y_specs = []
+    y = 0
+    while y < height:
+        h = min(max_tile, height - y)
+        y_specs.append((y, h))
+        y += h
+    return [(tx, ty, tw, th) for (ty, th) in y_specs for (tx, tw) in x_specs]
+
+
+def score_tile(initial_grid, tile, width, height):
+    """
+    Score a tile's priority for query ordering.
+    Higher = more dynamic content = query first.
+    """
+    tx, ty, tw, th = tile
+    score = 0.0
+    n_settlements = 0
+    for dy in range(th):
+        for dx in range(tw):
+            cell = initial_grid[ty + dy][tx + dx]
+            if cell == 1:
+                score += 5.0
+                n_settlements += 1
+            elif cell == 2:
+                score += 6.0
+                n_settlements += 1
+            elif cell == 4:
+                score += 0.3
+            elif cell in (0, 11):
+                score += 0.5
+    for dy in range(th):
+        for dx in range(tw):
+            y, x = ty + dy, tx + dx
+            cell = initial_grid[y][x]
+            if cell not in (10, 5):
+                for ny, nx in [(y-1, x), (y+1, x), (y, x-1), (y, x+1)]:
+                    if 0 <= ny < height and 0 <= nx < width:
+                        if initial_grid[ny][nx] == 10:
+                            score += 0.3
+                            break
+    if n_settlements >= 2:
+        score += n_settlements * 1.0
+    return score
+
+
 def plan_viewports(width, height, num_queries, vw=15, vh=15):
-    """
-    Generate viewport positions to cover as much of the map as possible.
-    Returns a list of (vx, vy) positions.
-    """
-    viewports = []
-    # Tile the map with overlapping viewports
-    y_positions = list(range(0, height, vh - 2))  # slight overlap
-    x_positions = list(range(0, width, vw - 2))
-
-    for vy in y_positions:
-        for vx in x_positions:
-            viewports.append((vx, vy))
-
-    # Center viewport for good coverage of middle
-    cx, cy = (width - vw) // 2, (height - vh) // 2
-    viewports.insert(0, (cx, cy))
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for v in viewports:
-        if v not in seen:
-            seen.add(v)
-            unique.append(v)
-
-    return unique[:num_queries]
+    """Legacy wrapper — returns (vx, vy) list from the non-overlapping grid."""
+    tiles = compute_tile_grid(width, height, max_tile=min(vw, vh))
+    return [(tx, ty) for (tx, ty, tw, th) in tiles[:num_queries]]
 
 
 def _save_observations(observations, round_id):
@@ -269,84 +303,229 @@ def main():
         print("\nDone!")
         return
 
-    # Step 4: Plan query strategy
-    # Prepare viewports to cover the map
-    max_viewports = max(1, remaining // seeds_count)
-    all_viewports = plan_viewports(width, height, max_viewports)
-    print(f"\n--- Query Strategy: ~{max_viewports} queries per seed, {len(all_viewports)} viewports planned ---")
+    # Step 4: Detect deterministic vs stochastic simulation
+    #   Query the highest-priority tile on seed 0 twice and compare results.
+    tiles = compute_tile_grid(width, height)
+    n_tiles = len(tiles)
+    grid0 = initial_states[0]["grid"]
+    scored0 = [(score_tile(grid0, t, width, height), t) for t in tiles]
+    scored0.sort(reverse=True)
+    detect_tile = scored0[0][1]  # most dynamic tile for seed 0
+    dtx, dty, dtw, dth = detect_tile
 
-    # Step 5: Observe and build predictions
-    all_observations = []  # collect for saving
-    queries_used_total = remaining  # track dynamically
+    print(f"\n--- Detection: querying seed 0 tile ({dtx},{dty}) {dtw}x{dth} twice ---")
+    result1 = simulate(round_id, 0, dtx, dty, dtw, dth)
+    time.sleep(1.0)
+    result2 = simulate(round_id, 0, dtx, dty, dtw, dth)
+    time.sleep(1.0)
+    queries_done = 2
+
+    is_deterministic = (result1["grid"] == result2["grid"])
+    mode = "DETERMINISTIC" if is_deterministic else "STOCHASTIC"
+    print(f"  Results {'match' if is_deterministic else 'differ'} → {mode} mode")
+    print(f"  Remaining after detection: {remaining - queries_done}")
+
+    # Prepare per-seed accumulators
+    seed_initial_preds = []
+    seed_obs_preds = []
+    seed_obs_counts = []
+    for s in range(seeds_count):
+        grid = initial_states[s]["grid"]
+        seed_initial_preds.append(build_initial_prediction(grid, width, height))
+        seed_obs_preds.append(np.zeros((height, width, NUM_CLASSES)))
+        seed_obs_counts.append(np.zeros((height, width)))
+
+    # Record detection queries as observations for seed 0
+    all_observations = []
+    for result in [result1, result2]:
+        update_prediction_with_observation(
+            seed_obs_preds[0], result["grid"], result["viewport"],
+            seed_obs_counts[0]
+        )
+        all_observations.append({
+            "seed_index": 0,
+            "viewport": result["viewport"],
+            "grid": result["grid"],
+        })
+
+    # Mark the detection tile as already queried for seed 0
+    seed_queues = []
+    for s in range(seeds_count):
+        grid = initial_states[s]["grid"]
+        scored = [(score_tile(grid, t, width, height), t) for t in tiles]
+        scored.sort(reverse=True)
+        if s == 0:
+            # Remove the detection tile (already queried twice)
+            scored = [(sc, t) for sc, t in scored if t != detect_tile]
+        seed_queues.append(scored)
+
+    query_limit = remaining
+
+    # Step 5: Execute strategy based on detected mode
+    total_needed = n_tiles * seeds_count
+    print(f"\n--- Strategy ({mode}): {n_tiles} tiles/seed × {seeds_count} seeds = "
+          f"{total_needed} for full coverage  (budget {query_limit}) ---")
+
+    if is_deterministic:
+        # DETERMINISTIC: cover all unique tiles, no re-queries needed
+        while queries_done < query_limit:
+            queried_any = False
+            for s in range(seeds_count):
+                if queries_done >= query_limit:
+                    break
+                if not seed_queues[s]:
+                    continue
+                _, (tx, ty, tw, th) = seed_queues[s].pop(0)
+                try:
+                    result = simulate(round_id, s, tx, ty, tw, th)
+                    update_prediction_with_observation(
+                        seed_obs_preds[s], result["grid"], result["viewport"],
+                        seed_obs_counts[s]
+                    )
+                    all_observations.append({
+                        "seed_index": s,
+                        "viewport": result["viewport"],
+                        "grid": result["grid"],
+                    })
+                    queries_done += 1
+                    queried_any = True
+                    tiles_left = len(seed_queues[s])
+                    used = result.get("queries_used", "?")
+                    max_q = result.get("queries_max", "?")
+                    print(f"  Seed {s} tile {n_tiles - tiles_left}/{n_tiles}: "
+                          f"({tx},{ty}) {tw}x{th}  budget {used}/{max_q}")
+                    time.sleep(1.0)
+                    if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
+                        print("  Budget exhausted!")
+                        break
+                except requests.HTTPError as e:
+                    if e.response is not None and e.response.status_code == 429:
+                        print(f"  Rate limited at seed {s}")
+                        break
+                    raise
+            if not queried_any:
+                break
+        # In deterministic mode, leftover queries are wasted (same result)
+        if queries_done < query_limit:
+            print(f"  Full coverage done ({queries_done} queries). "
+                  f"{query_limit - queries_done} queries unused (deterministic — no benefit to re-query).")
+
+    else:
+        # STOCHASTIC: cover all tiles, then re-query most dynamic tiles
+        while queries_done < query_limit:
+            queried_any = False
+            for s in range(seeds_count):
+                if queries_done >= query_limit:
+                    break
+                if not seed_queues[s]:
+                    continue
+                _, (tx, ty, tw, th) = seed_queues[s].pop(0)
+                try:
+                    result = simulate(round_id, s, tx, ty, tw, th)
+                    update_prediction_with_observation(
+                        seed_obs_preds[s], result["grid"], result["viewport"],
+                        seed_obs_counts[s]
+                    )
+                    all_observations.append({
+                        "seed_index": s,
+                        "viewport": result["viewport"],
+                        "grid": result["grid"],
+                    })
+                    queries_done += 1
+                    queried_any = True
+                    tiles_left = len(seed_queues[s])
+                    used = result.get("queries_used", "?")
+                    max_q = result.get("queries_max", "?")
+                    print(f"  Seed {s} tile {n_tiles - tiles_left}/{n_tiles}: "
+                          f"({tx},{ty}) {tw}x{th}  budget {used}/{max_q}")
+                    time.sleep(1.0)
+                    if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
+                        print("  Budget exhausted!")
+                        break
+                except requests.HTTPError as e:
+                    if e.response is not None and e.response.status_code == 429:
+                        print(f"  Rate limited at seed {s}")
+                        break
+                    raise
+            if not queried_any:
+                break
+
+        # Extra pass: re-query most dynamic tiles with remaining budget
+        if queries_done < query_limit:
+            print(f"  Full coverage done ({queries_done} queries). "
+                  f"Using {query_limit - queries_done} extra queries on dynamic tiles.")
+            extra_targets = []
+            for s in range(seeds_count):
+                grid = initial_states[s]["grid"]
+                for obs in all_observations:
+                    if obs["seed_index"] != s:
+                        continue
+                    vp = obs["viewport"]
+                    obs_grid = obs["grid"]
+                    changes = 0
+                    total = 0
+                    for dy in range(len(obs_grid)):
+                        for dx in range(len(obs_grid[0])):
+                            oy, ox = vp["y"] + dy, vp["x"] + dx
+                            if 0 <= oy < height and 0 <= ox < width:
+                                if terrain_to_class(grid[oy][ox]) != terrain_to_class(obs_grid[dy][dx]):
+                                    changes += 1
+                                total += 1
+                    if total > 0:
+                        extra_targets.append((changes / total, s,
+                                              (vp["x"], vp["y"], vp["w"], vp["h"])))
+            extra_targets.sort(reverse=True)
+
+            for change_rate, s, (tx, ty, tw, th) in extra_targets:
+                if queries_done >= query_limit:
+                    break
+                try:
+                    result = simulate(round_id, s, tx, ty, tw, th)
+                    update_prediction_with_observation(
+                        seed_obs_preds[s], result["grid"], result["viewport"],
+                        seed_obs_counts[s]
+                    )
+                    all_observations.append({
+                        "seed_index": s,
+                        "viewport": result["viewport"],
+                        "grid": result["grid"],
+                    })
+                    queries_done += 1
+                    used = result.get("queries_used", "?")
+                    max_q = result.get("queries_max", "?")
+                    print(f"  Extra: seed {s} ({tx},{ty}) {tw}x{th}  "
+                          f"change_rate={change_rate:.2f}  budget {used}/{max_q}")
+                    time.sleep(1.0)
+                    if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
+                        break
+                except requests.HTTPError as e:
+                    if e.response is not None and e.response.status_code == 429:
+                        break
+                    raise
+
+    # Step 6: Finalize and submit predictions
     for seed_idx in range(seeds_count):
-        # Recalculate budget for remaining seeds
-        seeds_left = seeds_count - seed_idx
-        budget_now = check_budget(verbose=False)
-        if budget_now:
-            queries_used_total = budget_now["queries_max"] - budget_now["queries_used"]
-        queries_for_this_seed = max(1, queries_used_total // seeds_left)
-
-        print(f"\n--- Seed {seed_idx} ({queries_for_this_seed} queries planned, {queries_used_total} remaining) ---")
-        grid = initial_states[seed_idx]["grid"]
-        initial_pred = build_initial_prediction(grid, width, height)
-
-        # Accumulator for observations
-        obs_pred = np.zeros((height, width, NUM_CLASSES))
-        obs_count = np.zeros((height, width))
-
-        # Run queries for this seed
-        viewports_to_use = all_viewports[:queries_for_this_seed]
-        for i, (vx, vy) in enumerate(viewports_to_use):
-            try:
-                result = simulate(round_id, seed_idx, vx, vy)
-                update_prediction_with_observation(
-                    obs_pred, result["grid"], result["viewport"], obs_count
-                )
-                all_observations.append({
-                    "seed_index": seed_idx,
-                    "viewport": result["viewport"],
-                    "grid": result["grid"],
-                })
-                used = result.get("queries_used", "?")
-                max_q = result.get("queries_max", "?")
-                print(f"  Query {i+1}: viewport ({vx},{vy}) — budget {used}/{max_q}")
-
-                # Respect rate limit (5 req/s max, use 1s for safety)
-                time.sleep(1.0)
-
-                # Stop if budget exhausted
-                if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
-                    print("  Budget exhausted!")
-                    _save_observations(all_observations, round_id)
-                    break
-
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
-                    print(f"  Rate limited or budget exhausted at query {i+1}")
-                    _save_observations(all_observations, round_id)
-                    break
-                raise
-
-        # Finalize prediction for this seed
-        final_pred = finalize_prediction(obs_pred, obs_count, initial_pred)
-
-        # Submit
+        final_pred = finalize_prediction(
+            seed_obs_preds[seed_idx], seed_obs_counts[seed_idx],
+            seed_initial_preds[seed_idx]
+        )
         try:
             result = submit_prediction(round_id, seed_idx, final_pred)
-            print(f"  Submitted: {result.get('status', 'unknown')}")
+            print(f"  Seed {seed_idx}: {result.get('status', 'unknown')}")
         except requests.HTTPError as e:
             print(f"  Submit FAILED for seed {seed_idx}: {e}")
             if e.response is not None:
                 print(f"    Response: {e.response.text[:200]}")
             continue
 
-        observed_pct = (obs_count > 0).sum() / (width * height) * 100
+        observed_pct = (seed_obs_counts[seed_idx] > 0).sum() / (width * height) * 100
         print(f"  Cells observed: {observed_pct:.1f}% of map")
 
     # Save all collected observations for offline analysis
     _save_observations(all_observations, round_id)
 
-    print("\n" + "=" * 50)
+    print(f"\n  Mode: {mode} | Total queries: {queries_done}")
+    print("=" * 50)
     print("All seeds submitted! Check results at app.ainm.no")
     print("=" * 50)
 
