@@ -37,7 +37,7 @@ import train_cnn
 # Configuration
 # ---------------------------------------------------------------------------
 
-ARCH = "unet_sim"                       # MiniUNet with simulation-replay observation channels
+ARCH = "unet_cond"                      # MiniUNet with multi-replay conditioned observation channels
 POLL_INTERVAL_S = 20 * 60              # 20 minutes between checks
 GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
 MAX_TRAIN_EPOCHS = 4_000               # max new epochs per training cycle
@@ -293,7 +293,7 @@ def retrain():
     train_cnn.EPOCHS = MAX_TRAIN_EPOCHS
 
     try:
-        train_cnn.train(all_data, reset=False, forever=False, arch=ARCH, cv="round")
+        train_cnn.train(all_data, reset=False, forever=False, arch=ARCH, cv="all")
     except KeyboardInterrupt:
         raise  # propagate to outer loop
     except Exception as e:

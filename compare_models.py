@@ -339,7 +339,7 @@ def evaluate_model(ckpt_path, all_data, val_quadrant, use_viewports=False):
         features = encode_initial_grid(initial_grid, width, height)
 
         # For obs-conditioned models: append observation channels (7 extra → 21 total)
-        if arch in ("unet_obs", "unet_sim"):
+        if arch in ("unet_obs", "unet_sim", "unet_cond"):
             all_obs = _load_obs_for_round(round_id_short)
             seed_obs = [o for o in all_obs if o.get("seed_index") == seed_idx]
             obs_feat = encode_obs_channels(seed_obs, width, height)
