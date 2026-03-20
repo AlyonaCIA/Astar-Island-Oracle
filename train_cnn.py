@@ -795,11 +795,13 @@ def train(all_data, reset=False, forever=False, arch="quick"):
                     epoch_train_loss += loss.item()
                     total_train_batches += 1
 
-                # Validate on held-out quadrant (dropout stays active)
+                # Validate on held-out quadrant (dropout OFF, like simple CNN)
+                model.eval()
                 with torch.no_grad():
                     V_full = v_hw.unsqueeze(0).expand(N, -1, -1)
                     pred_all = model(X)
                     epoch_val_loss += kl_divergence_loss(pred_all, Y, mask=V_full).item()
+                model.train()
 
             avg_train = epoch_train_loss / max(total_train_batches, 1)
             val_loss = epoch_val_loss / 4

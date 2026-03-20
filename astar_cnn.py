@@ -310,7 +310,7 @@ MODEL_REGISTRY = {
     "quick": QuickCNN,
     "quick3": QuickCNN3,
     "unet": MiniUNet,
-    "unet_aug": MiniUNet,  # same architecture, trained with augmented data
+    "unet_aug": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1)),  # lower dropout for augmented training
 }
 
 CHECKPOINT_DIR_MAP = {

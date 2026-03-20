@@ -1,7 +1,7 @@
 """
 Astar Island — Automated Pipeline (Cron)
 
-Runs continuously, checking every 30 minutes for active rounds.
+Runs continuously, checking every 100 minutes for active rounds.
 
 Pipeline per round:
   1. Check for active round + budget
@@ -11,8 +11,8 @@ Pipeline per round:
   5. Log observations to disk
   6. Wait 10 minutes for ground truth availability
   7. Fetch ground truth from completed rounds
-  8. Retrain UNet (up to 10,000 new epochs from last checkpoint)
-  9. Sleep 30 minutes, repeat
+  8. Retrain UNet (up to 4,000 new epochs from last checkpoint)
+  9. Sleep 100 minutes, repeat
 
 Usage:
     python cron.py              # run forever
@@ -37,10 +37,10 @@ import train_cnn
 # Configuration
 # ---------------------------------------------------------------------------
 
-ARCH = "unet"                           # MiniUNet (normal, not augmented)
-POLL_INTERVAL_S = 30 * 60              # 30 minutes between checks
+ARCH = "unet_aug"                       # MiniUNet with augmented data (dropout=0.1)
+POLL_INTERVAL_S = 100 * 60             # 100 minutes between checks (~160 min round cadence)
 GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
-MAX_TRAIN_EPOCHS = 10_000              # max new epochs per training cycle
+MAX_TRAIN_EPOCHS = 4_000               # max new epochs per training cycle
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "cron_state.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "cron.log")
