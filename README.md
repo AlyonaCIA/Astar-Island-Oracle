@@ -128,7 +128,7 @@ Full pipeline that guarantees a submission even if the CNN fails:
 1. Fetches round info from API
 2. **Immediately submits prior-based fallback** (same quality as Method 2, without using queries)
 3. Spends query budget collecting observations → saves to `data/`
-4. Trains a small CNN (14→32→32→6 channels) on the collected data
+4. Trains a small CNN on the collected data
 5. Resubmits CNN predictions (overwrites fallback — only the last submission counts)
 
 If PyTorch is not installed, or the CNN crashes for any reason, the fallback from step 2 still stands.
@@ -140,6 +140,15 @@ If PyTorch is not installed, or the CNN crashes for any reason, the fallback fro
 ```bash
 python astar_cnn.py
 ```
+
+**Select architecture** via environment variable:
+
+```bash
+# PowerShell
+$env:ASTAR_MODEL="unet"; python astar_cnn.py
+```
+
+Available architectures: `quick` (default), `quick3`, `unet` (see Model Architectures below).
 
 **Time limit** (default 120 min, configurable):
 
@@ -158,21 +167,31 @@ Train the CNN **offline** using ground truth data from completed rounds — no q
 #### Step 1: Train
 
 ```bash
-python train_cnn.py
+python train_cnn.py                      # train default (quick) architecture
+python train_cnn.py --model unet         # train a specific architecture
+python train_cnn.py --model quick3 --reset  # train from scratch (clear old checkpoints)
+python train_cnn.py --fetch              # fetch latest ground truth from API first
+python train_cnn.py --forever            # train indefinitely until Ctrl+C
 ```
 
 What it does:
 
-1. Queries `GET /rounds` to find completed/scoring rounds
-2. Downloads ground truth via `GET /analysis/{round_id}/{seed_index}` for each seed
-3. **Caches everything in `data/ground_truth/`** — re-running skips the download
-4. Encodes initial grids into 14-channel feature tensors
-5. Splits each 40×40 map into 4 quadrants: **3 for training, 1 for validation** (bottom-right by default)
-6. Trains with **KL divergence loss** (same metric as competition scoring)
-7. Saves checkpoints every 25 epochs to `checkpoints/`
-8. Saves `checkpoints/cnn_latest.pt` at the end
+1. Loads cached ground truth from `data/ground_truth/` (or fetches from API with `--fetch`)
+2. Encodes initial grids into 14-channel feature tensors
+3. Splits each 40×40 map into 4 quadrants for **4-fold cross-validation** (rotate held-out quadrant)
+4. Trains with **KL divergence loss** (same metric as competition scoring)
+5. Saves checkpoints every 25 epochs to the architecture's checkpoint directory
+6. Saves `cnn_latest.pt` at the end
 
 **Resumable:** If interrupted (Ctrl+C), re-running picks up from the latest checkpoint automatically.
+
+Each architecture saves to its own checkpoint directory:
+
+| Architecture | Checkpoint dir |
+|---|---|
+| `quick` | `checkpoints/` |
+| `quick3` | `checkpoints_quick3/` |
+| `unet` | `checkpoints_unet/` |
 
 Training hyperparameters (via env vars or `.env`):
 
@@ -188,28 +207,57 @@ Example with custom settings:
 
 ```bash
 # PowerShell
-$env:ASTAR_TRAIN_EPOCHS="500"; $env:ASTAR_TRAIN_LR="5e-4"; python train_cnn.py
+$env:ASTAR_TRAIN_EPOCHS="500"; $env:ASTAR_TRAIN_LR="5e-4"; python train_cnn.py --model unet
 ```
 
 #### Step 2: Evaluate
 
 ```bash
-python eval_cnn.py                                   # evaluates cnn_latest.pt
-python eval_cnn.py checkpoints/cnn_epoch_0100.pt     # specific checkpoint
+python eval_cnn.py                                   # evaluates cnn_latest.pt (quick arch)
+python eval_cnn.py --arch unet                       # evaluates latest unet checkpoint
+python eval_cnn.py checkpoints/cnn_epoch_0100.pt     # specific checkpoint (auto-detects arch)
+python eval_cnn.py --viewports                       # also evaluate on your actual viewport regions
+python eval_cnn.py --arch unet --viewports           # combine options
 ```
 
-Compares the CNN checkpoint against two baselines on the validation quadrant:
+Compares the CNN checkpoint against two baselines:
 
 - **CNN** — trained model predictions
 - **Prior** — hand-tuned priors (same as Method 2)
 - **Uniform** — 1/6 everywhere
 
-Output includes:
+**Default output** (always shown):
 
-- Per-seed simulated competition score (`100 × exp(-3 × wKL)`)
-- Per-seed validation KL divergence
+- Per-seed simulated competition score (`100 × exp(-3 × wKL)`) on the full map
+- Per-seed validation KL divergence on the held-out quadrant
 - Averages across all seeds
 - Per-class KL breakdown (which terrain types the CNN struggles with)
+
+**`--viewports` flag** — Viewport-restricted evaluation:
+
+When enabled, the evaluator loads your cached observation files (`data/observations_*.json`) from previous rounds and computes metrics **only on the pixels you actually queried** during that round. This tells you how well the model would have performed in the regions you chose to observe, vs the full map.
+
+For each seed with observations, it reports:
+
+- Number of observed pixels (out of 1600 total)
+- Entropy-weighted KL and score restricted to those pixels, for CNN / Prior / Uniform
+- Averages across all seeds
+
+This is useful for understanding whether your **viewport strategy** (which regions you chose to observe) targeted pixels where the model was already accurate, or where the model was actually struggling.
+
+> **Note:** Observation files are only saved by `astar_cnn.py` during live rounds. If you only have ground truth data (from `--fetch`) but no observation files for a round, the viewport section will be skipped for that round.
+
+#### Step 3: Compare all architectures
+
+```bash
+python compare_models.py                          # train all 3 architectures, then compare
+python compare_models.py --epochs 100             # fewer epochs for a quick test
+python compare_models.py --eval-only              # skip training, just evaluate existing checkpoints
+python compare_models.py --models quick unet      # only train/evaluate specific models
+python compare_models.py --reset                  # clear all checkpoints and train from scratch
+```
+
+Trains each registered architecture on the same data with 4-fold cross-validation, then evaluates all of them plus baselines. Prints a side-by-side comparison table with full-map and validation scores per model.
 
 ---
 
@@ -254,11 +302,31 @@ Astar-Island-Oracle/
 ├── astar_baseline.py     # Method 2: prior + observation blending
 ├── astar_cnn.py          # Method 3: CNN with auto-fallback
 ├── train_cnn.py          # Method 4: offline training from ground truth
-├── eval_cnn.py           # Evaluate a trained checkpoint
+├── eval_cnn.py           # Evaluate a trained checkpoint (--viewports for viewport-only eval)
+├── compare_models.py     # Train & compare all architectures side-by-side
+├── analyze.py            # Plot training history curves
 ├── data/                 # Cached observations & ground truth (git-ignored)
-│   └── ground_truth/     # Downloaded analysis data per round/seed
-└── checkpoints/          # Saved model checkpoints (git-ignored)
+│   ├── observations_*.json   # Viewport queries saved by astar_cnn.py during live rounds
+│   ├── round_*.json          # Cached round info
+│   └── ground_truth/         # Downloaded analysis data per round/seed
+├── checkpoints/          # QuickCNN checkpoints
+├── checkpoints_quick3/   # QuickCNN3 checkpoints
+└── checkpoints_unet/     # MiniUNet checkpoints
 ```
+
+---
+
+## Model Architectures
+
+All models take a 14-channel input (8 one-hot terrain channels + 6 neighbour class frequency channels) and output a 6-class probability distribution per pixel.
+
+| Name | Key | Layers | Receptive field | Parameters | Notes |
+|---|---|---|---|---|---|
+| QuickCNN | `quick` | 14→32→32→6 (3×3 convs) | 5×5 | ~12K | Original, fast to train |
+| QuickCNN3 | `quick3` | 14→32→32→32→6 (3×3 convs) | 7×7 | ~22K | One extra hidden layer |
+| MiniUNet | `unet` | Encoder-decoder with skip connections, 2 pooling stages (40→20→10), bottleneck 128ch | Full map | ~250K | Sees global structure |
+
+All models use Dropout2d (default 0.2), softmax output, and probability floor clamping (0.01).
 
 ---
 
@@ -268,5 +336,5 @@ Astar-Island-Oracle/
 - **Multi-observation averaging** — query the same viewport multiple times per seed
 - **Simulation modeling** — implement growth/conflict/trade/winter mechanics to forecast outcomes
 - **Cross-seed learning** — all 5 seeds share hidden parameters; insights transfer
-- **Larger model** — deeper CNN, attention layers, or graph-based approaches
+- **Attention / ensemble** — spatial attention modules, or ensemble predictions from multiple architectures
 - **Accumulate training data** — every completed round adds more ground truth for offline training

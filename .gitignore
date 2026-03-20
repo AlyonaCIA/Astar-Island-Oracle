@@ -27,9 +27,15 @@ Desktop.ini
 .env
 *.token
 
+# Model weights
+*.pt
+*.pth
+*.onnx
+
 # Data / outputs
 data/
 checkpoints/
+checkpoints_*/
 *.npy
 *.npz
 *.pkl

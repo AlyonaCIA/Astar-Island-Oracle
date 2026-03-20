@@ -200,7 +200,7 @@ def encode_initial_grid(initial_grid, width, height):
     return features
 
 
-# --- CNN Model ---
+# --- CNN Models ---
 
 class QuickCNN(nn.Module):
     def __init__(self, dropout=0.2):
@@ -221,6 +221,111 @@ class QuickCNN(nn.Module):
         probs = torch.clamp(probs, min=PROB_FLOOR)
         probs = probs / probs.sum(dim=1, keepdim=True)
         return probs
+
+
+class QuickCNN3(nn.Module):
+    """QuickCNN with one additional hidden conv layer (receptive field 7x7)."""
+    def __init__(self, dropout=0.2):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels=14, out_channels=32, kernel_size=3, padding=1)
+        self.drop1 = nn.Dropout2d(p=dropout)
+        self.conv2 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
+        self.drop2 = nn.Dropout2d(p=dropout)
+        self.conv3 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
+        self.drop3 = nn.Dropout2d(p=dropout)
+        self.out_conv = nn.Conv2d(in_channels=32, out_channels=6, kernel_size=1)
+
+    def forward(self, x):
+        x = self.drop1(F.relu(self.conv1(x)))
+        x = self.drop2(F.relu(self.conv2(x)))
+        x = self.drop3(F.relu(self.conv3(x)))
+        logits = self.out_conv(x)
+        probs = F.softmax(logits, dim=1)
+        probs = torch.clamp(probs, min=PROB_FLOOR)
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        return probs
+
+
+class MiniUNet(nn.Module):
+    """Small U-Net for 40x40 maps. Encoder-decoder with skip connections."""
+    def __init__(self, dropout=0.2):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(14, 32, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+        )
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.pool2 = nn.MaxPool2d(2)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
+        )
+        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+        )
+        self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
+
+    def forward(self, x):
+        _, _, H, W = x.shape
+        pad_h = (2 - H % 2) % 2
+        pad_w = (2 - W % 2) % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        b = self.bottleneck(self.pool2(e2))
+        d2 = self.up2(b)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        logits = self.out_conv(d1)
+
+        if pad_h or pad_w:
+            logits = logits[:, :, :H, :W]
+
+        probs = F.softmax(logits, dim=1)
+        probs = torch.clamp(probs, min=PROB_FLOOR)
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        return probs
+
+
+MODEL_REGISTRY = {
+    "quick": QuickCNN,
+    "quick3": QuickCNN3,
+    "unet": MiniUNet,
+}
+
+CHECKPOINT_DIR_MAP = {
+    "quick": os.path.join(SCRIPT_DIR, "checkpoints"),
+    "quick3": os.path.join(SCRIPT_DIR, "checkpoints_quick3"),
+    "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
+}
+
+MODEL_ARCH = os.environ.get("ASTAR_MODEL", "quick")
+
+
+def make_model(arch="quick", **kwargs):
+    cls = MODEL_REGISTRY.get(arch)
+    if cls is None:
+        raise ValueError(f"Unknown architecture '{arch}'. Choose from: {list(MODEL_REGISTRY)}")
+    return cls(**kwargs)
 
 
 # --- Training Data Collection ---
@@ -398,7 +503,7 @@ def build_training_data(observations, initial_states, width, height):
 
 def train_model(X, y, epochs=80, lr=1e-3, batch_size=512):
     """Train the CNN on pixel-level data. Stops early if deadline approached."""
-    model = QuickCNN().to(DEVICE)
+    model = make_model(MODEL_ARCH).to(DEVICE)
 
     X_t = torch.tensor(X).unsqueeze(-1).unsqueeze(-1).to(DEVICE)
     y_t = torch.tensor(y).to(DEVICE)
@@ -445,29 +550,31 @@ def train_model(X, y, epochs=80, lr=1e-3, batch_size=512):
 
 def load_pretrained_checkpoint():
     """Load the latest pretrained checkpoint from train_cnn.py, if available."""
-    latest = os.path.join(CHECKPOINT_DIR, "cnn_latest.pt")
+    ckpt_dir = CHECKPOINT_DIR_MAP.get(MODEL_ARCH, CHECKPOINT_DIR)
+    latest = os.path.join(ckpt_dir, "cnn_latest.pt")
     if os.path.isfile(latest):
         path = latest
     else:
         # Fall back to highest epoch checkpoint
-        if not os.path.isdir(CHECKPOINT_DIR):
+        if not os.path.isdir(ckpt_dir):
             return None
-        files = [f for f in os.listdir(CHECKPOINT_DIR)
+        files = [f for f in os.listdir(ckpt_dir)
                  if f.startswith("cnn_epoch_") and f.endswith(".pt")]
         if not files:
             return None
         files.sort(key=lambda f: int(f.replace("cnn_epoch_", "").replace(".pt", "")),
                    reverse=True)
-        path = os.path.join(CHECKPOINT_DIR, files[0])
+        path = os.path.join(ckpt_dir, files[0])
 
     print(f"  Loading pretrained checkpoint: {os.path.basename(path)}")
-    model = QuickCNN().to(DEVICE)
     ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+    arch = ckpt.get("model_arch") or ckpt.get("metadata", {}).get("model_arch", "quick")
+    model = make_model(arch).to(DEVICE)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     epoch = ckpt.get("epoch", "?")
     val_loss = ckpt.get("val_loss", "?")
-    print(f"  Checkpoint epoch={epoch}, val_loss={val_loss}")
+    print(f"  Checkpoint epoch={epoch}, val_loss={val_loss}, arch={arch}")
     return model
 
 

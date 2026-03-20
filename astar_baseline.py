@@ -10,6 +10,7 @@ Strategy:
 
 import os
 import sys
+import json
 import time
 import numpy as np
 import requests
@@ -43,6 +44,8 @@ if not TOKEN:
 session = requests.Session()
 session.headers["Authorization"] = f"Bearer {TOKEN}"
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 NUM_CLASSES = 6
 PROB_FLOOR = 0.01  # Never assign 0 probability
 
@@ -216,6 +219,17 @@ def plan_viewports(width, height, num_queries, vw=15, vh=15):
     return unique[:num_queries]
 
 
+def _save_observations(observations, round_id):
+    """Save observations to disk for offline analysis."""
+    if not observations:
+        return
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path = os.path.join(DATA_DIR, f"observations_{round_id[:8]}.json")
+    with open(path, "w") as f:
+        json.dump(observations, f)
+    print(f"  Saved {len(observations)} observations to {path}")
+
+
 # --- Main ---
 
 def main():
@@ -262,6 +276,7 @@ def main():
     print(f"\n--- Query Strategy: ~{max_viewports} queries per seed, {len(all_viewports)} viewports planned ---")
 
     # Step 5: Observe and build predictions
+    all_observations = []  # collect for saving
     queries_used_total = remaining  # track dynamically
     for seed_idx in range(seeds_count):
         # Recalculate budget for remaining seeds
@@ -287,6 +302,11 @@ def main():
                 update_prediction_with_observation(
                     obs_pred, result["grid"], result["viewport"], obs_count
                 )
+                all_observations.append({
+                    "seed_index": seed_idx,
+                    "viewport": result["viewport"],
+                    "grid": result["grid"],
+                })
                 used = result.get("queries_used", "?")
                 max_q = result.get("queries_max", "?")
                 print(f"  Query {i+1}: viewport ({vx},{vy}) — budget {used}/{max_q}")
@@ -297,11 +317,13 @@ def main():
                 # Stop if budget exhausted
                 if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
                     print("  Budget exhausted!")
+                    _save_observations(all_observations, round_id)
                     break
 
             except requests.HTTPError as e:
                 if e.response is not None and e.response.status_code == 429:
                     print(f"  Rate limited or budget exhausted at query {i+1}")
+                    _save_observations(all_observations, round_id)
                     break
                 raise
 
@@ -320,6 +342,9 @@ def main():
 
         observed_pct = (obs_count > 0).sum() / (width * height) * 100
         print(f"  Cells observed: {observed_pct:.1f}% of map")
+
+    # Save all collected observations for offline analysis
+    _save_observations(all_observations, round_id)
 
     print("\n" + "=" * 50)
     print("All seeds submitted! Check results at app.ainm.no")

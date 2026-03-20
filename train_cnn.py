@@ -86,6 +86,7 @@ def get_rounds():
 def get_analysis(round_id, seed_index):
     resp = session.get(f"{BASE_URL}/analysis/{round_id}/{seed_index}")
     resp.raise_for_status()
+    time.sleep(1.0)
     return resp.json()
 
 
@@ -229,7 +230,7 @@ def encode_initial_grid(initial_grid, width, height):
 
 
 # ---------------------------------------------------------------------------
-# CNN model (same architecture as astar_cnn.py)
+# CNN models
 # ---------------------------------------------------------------------------
 
 class QuickCNN(nn.Module):
@@ -249,6 +250,122 @@ class QuickCNN(nn.Module):
         probs = torch.clamp(probs, min=PROB_FLOOR)
         probs = probs / probs.sum(dim=1, keepdim=True)
         return probs
+
+
+class QuickCNN3(nn.Module):
+    """QuickCNN with one additional hidden conv layer (receptive field 7x7)."""
+    def __init__(self, dropout=0.2):
+        super().__init__()
+        self.conv1 = nn.Conv2d(14, 32, kernel_size=3, padding=1)
+        self.drop1 = nn.Dropout2d(p=dropout)
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.drop2 = nn.Dropout2d(p=dropout)
+        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.drop3 = nn.Dropout2d(p=dropout)
+        self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
+
+    def forward(self, x):
+        x = self.drop1(F.relu(self.conv1(x)))
+        x = self.drop2(F.relu(self.conv2(x)))
+        x = self.drop3(F.relu(self.conv3(x)))
+        logits = self.out_conv(x)
+        probs = F.softmax(logits, dim=1)
+        probs = torch.clamp(probs, min=PROB_FLOOR)
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        return probs
+
+
+class MiniUNet(nn.Module):
+    """Small U-Net for 40x40 maps. Encoder-decoder with skip connections."""
+    def __init__(self, dropout=0.2):
+        super().__init__()
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(14, 32, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+        )
+        self.pool1 = nn.MaxPool2d(2)  # 40 -> 20
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.pool2 = nn.MaxPool2d(2)  # 20 -> 10
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
+        )
+        # Decoder
+        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)  # 10 -> 20
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)  # 20 -> 40
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+        )
+        self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
+
+    def forward(self, x):
+        # Pad to even dimensions if needed
+        _, _, H, W = x.shape
+        pad_h = (2 - H % 2) % 2
+        pad_w = (2 - W % 2) % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        b = self.bottleneck(self.pool2(e2))
+        d2 = self.up2(b)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        logits = self.out_conv(d1)
+
+        # Crop back to original size
+        if pad_h or pad_w:
+            logits = logits[:, :, :H, :W]
+
+        probs = F.softmax(logits, dim=1)
+        probs = torch.clamp(probs, min=PROB_FLOOR)
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        return probs
+
+
+# Registry for model selection
+MODEL_REGISTRY = {
+    "quick": QuickCNN,
+    "quick3": QuickCNN3,
+    "unet": MiniUNet,
+}
+
+# Separate checkpoint dirs per architecture
+CHECKPOINT_DIR_MAP = {
+    "quick": os.path.join(SCRIPT_DIR, "checkpoints"),
+    "quick3": os.path.join(SCRIPT_DIR, "checkpoints_quick3"),
+    "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
+}
+
+
+def make_model(arch="quick", **kwargs):
+    """Instantiate a model by architecture name."""
+    cls = MODEL_REGISTRY.get(arch)
+    if cls is None:
+        raise ValueError(f"Unknown architecture '{arch}'. Choose from: {list(MODEL_REGISTRY)}")
+    return cls(**kwargs)
+
+
+def get_checkpoint_dir(arch="quick"):
+    """Return the checkpoint directory for the given architecture."""
+    return CHECKPOINT_DIR_MAP.get(arch, CHECKPOINT_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -413,10 +530,11 @@ def kl_divergence_loss(pred_probs, target_probs, mask=None):
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def latest_checkpoint():
-    """Find the latest checkpoint file in CHECKPOINT_DIR."""
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("cnn_epoch_") and f.endswith(".pt")]
+def latest_checkpoint(ckpt_dir=None):
+    """Find the latest checkpoint file in the given checkpoint directory."""
+    d = ckpt_dir or CHECKPOINT_DIR
+    os.makedirs(d, exist_ok=True)
+    files = [f for f in os.listdir(d) if f.startswith("cnn_epoch_") and f.endswith(".pt")]
     if not files:
         return None
     # Parse epoch number
@@ -426,20 +544,25 @@ def latest_checkpoint():
         except ValueError:
             return -1
     files.sort(key=epoch_num)
-    return os.path.join(CHECKPOINT_DIR, files[-1])
+    return os.path.join(d, files[-1])
 
 
-def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, metadata):
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    path = os.path.join(CHECKPOINT_DIR, f"cnn_epoch_{epoch:04d}.pt")
-    torch.save({
+def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, metadata,
+                    ckpt_dir=None, arch=None):
+    d = ckpt_dir or CHECKPOINT_DIR
+    os.makedirs(d, exist_ok=True)
+    save_dict = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "train_loss": train_loss,
         "val_loss": val_loss,
         "metadata": metadata,
-    }, path)
+    }
+    if arch:
+        save_dict["model_arch"] = arch
+    path = os.path.join(d, f"cnn_epoch_{epoch:04d}.pt")
+    torch.save(save_dict, path)
     return path
 
 
@@ -451,27 +574,40 @@ def load_checkpoint(path, model, optimizer=None):
     return ckpt
 
 
-def _clear_checkpoints():
+def load_model_from_checkpoint(path):
+    """Load a checkpoint, auto-detect architecture, return (model, ckpt dict)."""
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+    arch = ckpt.get("model_arch") or ckpt.get("metadata", {}).get("model_arch", "quick")
+    model = make_model(arch).to(DEVICE)
+    model.load_state_dict(ckpt["model_state_dict"])
+    return model, ckpt
+
+
+def _clear_checkpoints(ckpt_dir=None):
     """Delete all existing checkpoints and training history."""
-    if not os.path.isdir(CHECKPOINT_DIR):
+    d = ckpt_dir or CHECKPOINT_DIR
+    if not os.path.isdir(d):
         return
     removed = 0
-    for f in os.listdir(CHECKPOINT_DIR):
-        fp = os.path.join(CHECKPOINT_DIR, f)
+    for f in os.listdir(d):
+        fp = os.path.join(d, f)
         if os.path.isfile(fp):
             os.remove(fp)
             removed += 1
     if removed:
-        print(f"  Cleared {removed} files from {CHECKPOINT_DIR}")
+        print(f"  Cleared {removed} files from {d}")
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(all_data, reset=False, forever=False):
+def train(all_data, reset=False, forever=False, arch="quick"):
+    ckpt_dir = get_checkpoint_dir(arch)
+
     print(f"\n{'='*60}")
     print(f"  Building datasets (4-fold quadrant cross-validation)")
+    print(f"  Architecture: {arch}")
     print(f"{'='*60}")
 
     features_list, targets_list, _, _, meta = \
@@ -501,7 +637,7 @@ def train(all_data, reset=False, forever=False):
     print(f"  4-fold CV: {pix_per_q * 3} train / {pix_per_q} val pixels per fold")
 
     # Model & optimizer
-    model = QuickCNN().to(DEVICE)
+    model = make_model(arch).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
     start_epoch = 1
@@ -509,9 +645,9 @@ def train(all_data, reset=False, forever=False):
     training_start = time.time()
 
     # Resume from checkpoint if available (unless --reset)
-    ckpt_path = None if reset else latest_checkpoint()
+    ckpt_path = None if reset else latest_checkpoint(ckpt_dir)
     if reset:
-        _clear_checkpoints()
+        _clear_checkpoints(ckpt_dir)
         print(f"\n  Training from scratch (--reset)")
     elif ckpt_path:
         print(f"\n  Resuming from {os.path.basename(ckpt_path)}")
@@ -524,7 +660,7 @@ def train(all_data, reset=False, forever=False):
 
     max_label = "∞ (Ctrl+C to stop)" if forever else str(EPOCHS)
     print(f"  Epochs: {start_epoch}→{max_label}, LR={LR}, Device={DEVICE}")
-    print(f"  Checkpoint every {CHECKPOINT_EVERY} epochs")
+    print(f"  Checkpoint every {CHECKPOINT_EVERY} epochs → {ckpt_dir}")
     print()
 
     # Dataset / DataLoader for map-level batching (masks applied per-fold)
@@ -532,6 +668,7 @@ def train(all_data, reset=False, forever=False):
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     metadata = {
+        "model_arch": arch,
         "num_maps": N,
         "map_size": f"{H}x{W}",
         "cross_validation": "4-fold quadrant",
@@ -541,7 +678,8 @@ def train(all_data, reset=False, forever=False):
     }
 
     # Training history log (append-friendly)
-    history_path = os.path.join(CHECKPOINT_DIR, "training_history.json")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    history_path = os.path.join(ckpt_dir, "training_history.json")
     history = []
     if not reset and os.path.exists(history_path):
         with open(history_path) as f:
@@ -620,7 +758,8 @@ def train(all_data, reset=False, forever=False):
                 metadata["end_time"] = datetime.datetime.now().isoformat()
                 metadata["total_epochs"] = epoch
                 metadata["best_val_loss"] = best_val
-                path = save_checkpoint(model, optimizer, epoch, avg_train, val_loss, metadata)
+                path = save_checkpoint(model, optimizer, epoch, avg_train, val_loss,
+                                       metadata, ckpt_dir=ckpt_dir, arch=arch)
                 print(f"    → Saved {os.path.basename(path)}")
                 # Flush history to disk at each checkpoint
                 with open(history_path, "w") as f:
@@ -631,19 +770,21 @@ def train(all_data, reset=False, forever=False):
         print(f"\n\n  Interrupted at epoch {last_epoch}. Saving checkpoint...")
 
     # Save final checkpoint
-    final_path = os.path.join(CHECKPOINT_DIR, "cnn_latest.pt")
+    final_path = os.path.join(ckpt_dir, "cnn_latest.pt")
     metadata["end_time"] = datetime.datetime.now().isoformat()
     metadata["total_epochs"] = last_epoch
     metadata["best_val_loss"] = best_val
     metadata["total_training_time_s"] = time.time() - training_start
-    torch.save({
+    save_dict = {
         "epoch": last_epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "train_loss": avg_train,
         "val_loss": val_loss,
         "metadata": metadata,
-    }, final_path)
+        "model_arch": arch,
+    }
+    torch.save(save_dict, final_path)
     # Final history flush
     with open(history_path, "w") as f:
         json.dump(history, f)
@@ -666,14 +807,20 @@ def main():
                         help="Train indefinitely until Ctrl+C (ignores ASTAR_TRAIN_EPOCHS)")
     parser.add_argument("--fetch", action="store_true",
                         help="Fetch/update ground truth from API (default: use local cache only)")
+    parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), default="quick",
+                        help="Model architecture to train (default: quick)")
     args = parser.parse_args()
+
+    arch = args.model
+    ckpt_dir = get_checkpoint_dir(arch)
 
     print("=" * 60)
     print("  Astar Island — Offline CNN Training")
     print("=" * 60)
     print(f"  Device: {DEVICE}")
+    print(f"  Architecture: {arch}")
     print(f"  Data dir: {DATA_DIR}")
-    print(f"  Checkpoint dir: {CHECKPOINT_DIR}")
+    print(f"  Checkpoint dir: {ckpt_dir}")
     if args.reset:
         print("  Mode: RESET (training from scratch)")
     if args.forever:
@@ -690,7 +837,7 @@ def main():
         print("No data to train on.")
         return
 
-    train(all_data, reset=args.reset, forever=args.forever)
+    train(all_data, reset=args.reset, forever=args.forever, arch=arch)
 
 
 if __name__ == "__main__":
