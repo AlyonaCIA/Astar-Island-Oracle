@@ -1,52 +1,26 @@
 # Astar Island Oracle
 
-## Challenge Overview
+Our toolkit for the **Astar Island** ML challenge — a Norse civilisation simulator where you observe a black-box world through limited viewports and predict the final terrain state. See [CHALLENGE.md](CHALLENGE.md) for full challenge details.
 
-**Goal:** Predict the probability distribution of terrain types across a 40×40 Norse civilisation simulation after 50 years.
+## The Challenge in Brief
 
-**Platform:** [app.ainm.no](https://app.ainm.no) | **API:** `https://api.ainm.no/astar-island/`
+A 40×40 procedurally generated map runs a Norse simulation for 50 years: settlements grow, factions clash, trade routes form, winters destroy. Each round gives you **5 seeds** (same map, different random outcomes) and **50 viewport queries** (max 15×15 each, shared across seeds). You submit an **H×W×6 probability tensor** per seed predicting 6 terrain classes per cell. Scored by entropy-weighted KL divergence against Monte Carlo ground truth — only dynamic cells matter.
 
-### How It Works
+## What This Codebase Does
 
-1. A round has a **fixed map** with **5 random seeds** and hidden simulation parameters
-2. You get **50 viewport queries** (max 15×15 cells each), shared across all 5 seeds
-3. Each query runs one stochastic simulation and shows the final state through your viewport
-4. Submit a **H×W×6 probability tensor** per seed predicting terrain class probabilities
+This repo contains a progression of approaches, from the simplest possible submission to offline-trained CNN models:
 
-### Terrain Classes (Prediction)
+| File | Purpose | When to use |
+|------|---------|-------------|
+| `astar_uniform.py` | Submits uniform 1/6 probability everywhere. Zero queries used. | Get on the leaderboard instantly, verify auth works |
+| `astar_baseline.py` | Hand-tuned terrain priors + 50-query observation blending | Quick reasonable baseline, collects observation data |
+| `astar_cnn.py` | Live CNN pipeline: submits fallback immediately, then trains CNN on observations and resubmits | Active round submissions — guarantees a score even if CNN fails |
+| `train_cnn.py` | Offline CNN training on ground truth from completed rounds | Between rounds — improve model with no time pressure |
+| `eval_cnn.py` | Evaluates checkpoints against competition metric (entropy-weighted KL) | Check model quality, compare CNN vs prior vs uniform |
+| `compare_models.py` | Trains and evaluates all 3 CNN architectures side-by-side | Architecture selection — find the best model |
+| `analyze.py` | Plots training curves from `training_history.json` | Diagnose training progress, spot overfitting |
 
-| Index | Class      | Description                          |
-|-------|------------|--------------------------------------|
-| 0     | Empty      | Ocean (10), Plains (11), Empty (0)   |
-| 1     | Settlement | Active Norse settlement              |
-| 2     | Port       | Coastal settlement with harbour      |
-| 3     | Ruin       | Collapsed settlement                 |
-| 4     | Forest     | Provides food to adjacent settlements|
-| 5     | Mountain   | Impassable, static                   |
-
-### Simulation Phases (per year, 50 years total)
-
-1. **Growth** — food production, population growth, port development, expansion
-2. **Conflict** — raids, looting, conquest (longships extend range)
-3. **Trade** — ports trade food/wealth, tech diffusion
-4. **Winter** — food loss, potential collapse → Ruins
-5. **Environment** — ruins reclaimed by settlements (→ outpost) or forest
-
-### Key Constraints
-
-- **50 queries total** per round across all 5 seeds
-- **Stochastic** — same seed produces different outcomes each run
-- **Hidden parameters** — govern world behavior, same across all seeds in a round
-- Static cells: Ocean, Mountain (never change), Forest (mostly static)
-- Dynamic cells: Settlement, Port, Ruin (the interesting predictions)
-
-### Scoring
-
-- **Entropy-weighted KL divergence** between prediction and ground truth
-- Ground truth computed from hundreds of Monte Carlo runs
-- Score: `100 × exp(-3 × weighted_kl)` → 0-100 scale
-- **Critical:** Never assign 0.0 probability — use floor of 0.01, then renormalize
-- Round score = average of 5 seed scores; leaderboard = best round ever
+**Data flow:** Live scripts (`astar_baseline.py`, `astar_cnn.py`) save observations to `data/`. After rounds complete, `train_cnn.py --fetch` downloads ground truth for offline training. Checkpoints are saved per architecture (`checkpoints/`, `checkpoints_quick3/`, `checkpoints_unet/`). The live script `astar_cnn.py` can load pre-trained checkpoints to get a head-start during active rounds.
 
 ---
 
