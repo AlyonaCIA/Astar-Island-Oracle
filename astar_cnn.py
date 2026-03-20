@@ -875,7 +875,7 @@ def train_model(X, y, epochs=80, lr=1e-3, batch_size=512):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.NLLLoss()
 
     # Reserve 60s for prediction + submission
     min_remaining = 60
@@ -890,11 +890,9 @@ def train_model(X, y, epochs=80, lr=1e-3, batch_size=512):
         n_batches = 0
         for X_batch, y_batch in loader:
             optimizer.zero_grad()
-            x = F.relu(model.conv1(X_batch))
-            x = F.relu(model.conv2(x))
-            logits = model.out_conv(x)
-            logits = logits.squeeze(-1).squeeze(-1)
-            loss = loss_fn(logits, y_batch)
+            probs = model(X_batch)
+            probs = probs.squeeze(-1).squeeze(-1)
+            loss = loss_fn(torch.log(probs.clamp(min=1e-8)), y_batch)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
