@@ -1,7 +1,7 @@
 """
 Astar Island — Automated Pipeline (Cron)
 
-Runs continuously, checking every 100 minutes for active rounds.
+Runs continuously, checking every 60 minutes for active rounds.
 
 Pipeline per round:
   1. Check for active round + budget
@@ -12,7 +12,7 @@ Pipeline per round:
   6. Wait 10 minutes for ground truth availability
   7. Fetch ground truth from completed rounds
   8. Retrain UNet (up to 4,000 new epochs from last checkpoint)
-  9. Sleep 100 minutes, repeat
+  9. Sleep 60 minutes, repeat
 
 Usage:
     python cron.py              # run forever
@@ -38,7 +38,7 @@ import train_cnn
 # ---------------------------------------------------------------------------
 
 ARCH = "unet_aug"                       # MiniUNet with augmented data (dropout=0.1)
-POLL_INTERVAL_S = 100 * 60             # 100 minutes between checks (~160 min round cadence)
+POLL_INTERVAL_S = 60 * 60              # 60 minutes between checks
 GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
 MAX_TRAIN_EPOCHS = 4_000               # max new epochs per training cycle
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -257,9 +257,9 @@ def run_pipeline():
 
 
 def retrain():
-    """Fetch the latest ground truth and retrain the UNet."""
+    """Fetch the latest ground truth and retrain the UNet from scratch."""
 
-    # 1. Fetch / refresh ground truth
+    # 1. Fetch / refresh ground truth (all rounds, all seeds)
     log.info("--- Fetching ground truth from API ---")
     try:
         all_data = train_cnn.fetch_ground_truth()
@@ -272,21 +272,15 @@ def retrain():
         log.warning("No training data available. Skipping retraining.")
         return
 
-    # 2. Compute target epoch = current + MAX_TRAIN_EPOCHS
-    current_epoch = get_current_epoch()
-    target_epoch = current_epoch + MAX_TRAIN_EPOCHS
-    log.info(
-        f"Current epoch: {current_epoch} → "
-        f"will train up to epoch {target_epoch} "
-        f"(max {MAX_TRAIN_EPOCHS} new epochs)"
-    )
+    log.info(f"Training data: {len(all_data)} samples (all rounds/seeds)")
+    log.info(f"Resetting checkpoints — training from epoch 0 to {MAX_TRAIN_EPOCHS}")
 
-    # 3. Temporarily override the global EPOCHS and run training
+    # 2. Train from scratch with all data (augmentation applied inside train())
     original_epochs = train_cnn.EPOCHS
-    train_cnn.EPOCHS = target_epoch
+    train_cnn.EPOCHS = MAX_TRAIN_EPOCHS
 
     try:
-        train_cnn.train(all_data, reset=False, forever=False, arch=ARCH)
+        train_cnn.train(all_data, reset=True, forever=False, arch=ARCH)
     except KeyboardInterrupt:
         raise  # propagate to outer loop
     except Exception as e:
@@ -328,6 +322,8 @@ def main():
         log.info("  Mode:          --once (single cycle)")
     log.info("")
 
+    first_cycle = True
+
     while True:
         try:
             submitted = run_pipeline()
@@ -340,6 +336,13 @@ def main():
                 )
                 time.sleep(GT_WAIT_S)
                 retrain()
+            elif first_cycle:
+                # First run: always retrain from scratch with existing data
+                log.info("First cycle — retraining from scratch with all "
+                         "available ground truth...")
+                retrain()
+
+            first_cycle = False
 
         except KeyboardInterrupt:
             log.info("\nInterrupted by user. Exiting.")
