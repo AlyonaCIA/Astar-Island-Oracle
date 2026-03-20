@@ -37,7 +37,7 @@ import train_cnn
 # Configuration
 # ---------------------------------------------------------------------------
 
-ARCH = "unet_v2"                        # MiniUNetV2 with self-attention + cross-seed obs
+ARCH = "unet_sim"                       # MiniUNet with simulation-replay observation channels
 POLL_INTERVAL_S = 20 * 60              # 20 minutes between checks
 GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
 MAX_TRAIN_EPOCHS = 4_000               # max new epochs per training cycle
