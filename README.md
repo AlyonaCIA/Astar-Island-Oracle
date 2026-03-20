@@ -2,6 +2,33 @@
 
 Our toolkit for the **Astar Island** ML challenge — a Norse civilisation simulator where you observe a black-box world through limited viewports and predict the final terrain state. See [CHALLENGE.md](CHALLENGE.md) for full challenge details.
 
+---
+
+## Table of Contents
+
+- [The Challenge in Brief](#the-challenge-in-brief)
+- [What This Codebase Does](#what-this-codebase-does)
+- [Setup](#setup)
+- [Methods](#methods)
+  - [Method 1 — Uniform Fallback](#method-1-uniform-fallback-astar_uniformpy)
+  - [Method 2 — Prior + Observation Blending](#method-2-prior-observation-blending-astar_baselinepy)
+  - [Method 3 — CNN with Fallback](#method-3-cnn-with-fallback-astar_cnnpy)
+  - [Method 4 — Offline CNN Training](#method-4-offline-cnn-training-train_cnnpy-eval_cnnpy)
+- [Viewport Sampling & Query Strategy](#viewport-sampling-query-strategy)
+  - [Constraints](#constraints)
+  - [Phase 1 — Tile Grid Generation](#phase-1-tile-grid-generation-compute_tile_grid)
+  - [Phase 2 — Tile Priority Scoring](#phase-2-tile-priority-scoring-score_tile)
+  - [Phase 3 — Round-Robin Coverage with Dynamic Re-Ranking](#phase-3-round-robin-coverage-with-dynamic-re-ranking)
+  - [Phase 4 — Extra Queries on Dynamic & High-Interest Areas](#phase-4-extra-queries-on-dynamic-high-interest-areas)
+  - [Worked Example — 40×40 Map, 50 Budget, 5 Seeds](#worked-example-4040-map-50-budget-5-seeds)
+  - [Visualising Coverage](#visualising-coverage)
+- [Recommended Workflow](#recommended-workflow)
+- [Project Structure](#project-structure)
+- [Model Architectures](#model-architectures)
+- [Improving Further](#improving-further)
+
+---
+
 ## The Challenge in Brief
 
 A 40×40 procedurally generated map runs a Norse simulation for 50 years: settlements grow, factions clash, trade routes form, winters destroy. Each round gives you **5 seeds** (same map, different random outcomes) and **50 viewport queries** (max 15×15 each, shared across seeds). You submit an **H×W×6 probability tensor** per seed predicting 6 terrain classes per cell. Scored by entropy-weighted KL divergence against Monte Carlo ground truth — only dynamic cells matter.
@@ -235,6 +262,183 @@ Trains each registered architecture on the same data with 4-fold cross-validatio
 
 ---
 
+## Viewport Sampling & Query Strategy
+
+The query strategy is the most critical part of the pipeline. With only **50 queries** shared across 5 seeds on a 1600-cell map, every viewport must extract maximum information. The strategy is implemented in `astar_cnn.py` and runs in four phases.
+
+### Constraints
+
+| Constraint | Value |
+|---|---|
+| Map size | 40×40 = 1,600 cells |
+| Seeds per round | 5 (same map, different stochastic outcomes) |
+| Total query budget | 50 (shared across all seeds) |
+| Viewport size | 5×5 to 15×15 (always request max 15×15) |
+| Cost per query | 1, regardless of viewport size |
+| Simulation type | Stochastic — same viewport gives different results each time |
+
+**Key insight:** Since every query costs 1 budget regardless of viewport size, we always request the full 15×15 viewport to maximise information per query.
+
+### Phase 1 — Tile Grid Generation (`compute_tile_grid`)
+
+Generates a grid of **full-size 15×15 viewports** that covers the entire 40×40 map. Instead of shrinking edge tiles (which wastes viewport capacity), edge tiles are **shifted inward** to stay within bounds, creating natural overlap.
+
+**Algorithm:**
+1. Calculate how many tiles are needed per axis: `ceil(40 / 15) = 3`
+2. Distribute tile start positions evenly across `[0, max_start]` where `max_start = 40 - 15 = 25`
+3. Result: positions at `x = [0, 12, 25]` and `y = [0, 12, 25]`
+
+**40×40 tile layout (9 tiles, all 15×15):**
+
+```
+      x=0       x=12      x=25
+      ├──15──┤  ├──15──┤  ├──15──┤
+y=0   [A         ][B         ][C         ]     row 0: y covers [0..14]
+         ┌─overlap─┐  ┌─overlap─┐
+y=12  [D         ][E         ][F         ]     row 1: y covers [12..26]
+         ┌─overlap─┐  ┌─overlap─┐
+y=25  [G         ][H         ][I         ]     row 2: y covers [25..39]
+```
+
+- **100% map coverage** — every pixel is observed at least once
+- **All tiles are 15×15** — no wasted viewport capacity
+- **375 cells** (23%) are covered by 2+ tiles — providing natural overlap for better stochastic averaging
+- **0 pixels outside the map** — no information wasted
+- **2,025 total pixels** queried per full coverage cycle vs 1,600 with the old non-overlapping scheme (+26.6% more data)
+
+### Phase 2 — Tile Priority Scoring (`score_tile`)
+
+Each tile is scored based on the initial terrain it contains. Higher-scored tiles are queried first since they contain more dynamic content where observations matter most.
+
+**Scoring weights per cell:**
+
+| Terrain | Code | Points | Rationale |
+|---|---|---|---|
+| Port | 2 | 6.0 | Most dynamic — trade activity |
+| Settlement | 1 | 5.0 | Dynamic — growth, conflict, death |
+| Plains/Empty | 0, 11 | 0.5 | Expansion potential |
+| Forest | 4 | 0.3 | Mostly static but supports settlements |
+| Ocean | 10 | 0.0 | Completely static |
+| Mountain | 5 | 0.0 | Completely static |
+
+**Bonus modifiers:**
+- **Coastal bonus (+0.3):** Land cells adjacent to ocean (potential port development)
+- **Settlement cluster bonus (+N):** If a tile contains 2+ settlements/ports, add N bonus (more interaction = more dynamism)
+
+**Example:** A tile containing 2 settlements, 1 port, and 50 plains cells near the coast would score: `2×5.0 + 1×6.0 + 50×0.5 + coastal_bonuses + cluster_bonus(3) ≈ 44+`
+
+### Phase 3 — Round-Robin Coverage with Dynamic Re-Ranking
+
+The main observation loop uses a **round-robin strategy** across seeds with **adaptive re-ranking** after each round.
+
+**How it works:**
+
+1. Each seed gets its own priority queue of 9 tiles, sorted by `score_tile`
+2. In each "round", pop the highest-priority tile from each seed and query it
+3. After each round (except the first), **re-rank** remaining tiles using `rescore_tile`
+
+**Re-ranking (`rescore_tile`):**
+
+After observing some tiles, unqueried tiles near high-activity areas get boosted. For each already-observed tile:
+1. Compute `change_rate` = fraction of cells where observed class ≠ initial class
+2. Compute `proximity` = linear falloff from 0 to 30 cells distance
+3. Add bonus: `change_rate × proximity × 5.0`
+
+This means if Tile A shows 40% of cells changed from their initial state, nearby unqueried Tile B gets a significant priority boost — the algorithm "follows the action."
+
+**Round-robin sequence (first round, 5 seeds):**
+
+```
+Query 1:  Seed 0, highest-scored tile
+Query 2:  Seed 1, highest-scored tile
+Query 3:  Seed 2, highest-scored tile
+Query 4:  Seed 3, highest-scored tile
+Query 5:  Seed 4, highest-scored tile
+--- re-rank remaining tiles using observed change rates ---
+Query 6:  Seed 0, 2nd highest tile (re-ranked)
+Query 7:  Seed 1, 2nd highest tile (re-ranked)
+...
+Query 45: Seed 4, 9th tile  (full coverage done)
+```
+
+**Full coverage cost:** 9 tiles × 5 seeds = **45 queries** → leaves **5 queries** for Phase 4.
+
+### Phase 4 — Extra Queries on Dynamic & High-Interest Areas
+
+After full coverage, remaining budget is spent on two interleaved sources:
+
+#### Source A — Observed-Dynamic Re-Queries
+
+Re-query tiles that showed the most changes from the initial state. These are tiles where the stochastic simulation produced different terrain than the initial grid, so additional observations improve our probability estimates.
+
+Each previously-observed tile is scored by:
+```
+change_rate = (cells where observed_class ≠ initial_class) / total_cells
+```
+
+#### Source B — Interest-Centred Viewports (`compute_interest_viewports`)
+
+Generate new viewport positions (not from the grid) that are **centred on the most interesting map regions**. These are always full 15×15 and always within bounds.
+
+**Algorithm:**
+1. Build a per-cell interest heatmap (same weights as `score_tile`: ports=6, settlements=5, etc.)
+2. Compute a summed area table (SAT) for O(1) viewport scoring
+3. Score every possible 15×15 viewport position (676 candidates on a 40×40 map)
+4. Apply a mild diversity penalty for positions too close to already-queried tiles
+5. Select top-N positions with minimum 3-cell separation between centres
+
+**Interleaving:** Extra targets alternate between Source A (re-query dynamic) and Source B (new interest viewports), prioritised by score. This ensures the extra budget benefits both stochastic averaging and coverage of high-value regions.
+
+### Worked Example — 40×40 Map, 50 Budget, 5 Seeds
+
+```
+Budget: 50 queries total
+
+Phase 1: Generate 9 tiles (3×3 grid, all 15×15)
+  Tiles at: (0,0) (12,0) (25,0) (0,12) (12,12) (25,12) (0,25) (12,25) (25,25)
+
+Phase 2: Score and sort tiles per seed
+  Seed 0 priority: tile(12,12)=42.3, tile(0,0)=31.1, tile(25,12)=28.7, ...
+  Seed 1 priority: tile(12,12)=42.3, tile(0,12)=33.5, ...
+  (same map, different priorities per seed due to initial state differences)
+
+Phase 3: Round-robin coverage
+  Round 1 (queries 1-5):   each seed queries its top tile
+  Round 2 (queries 6-10):  re-rank, each seed queries next best
+  ...
+  Round 9 (queries 41-45): last tile per seed — full coverage!
+
+Phase 4: Extra queries (5 remaining)
+  Query 46: Re-query seed 2 tile(12,12) — 35% change rate
+  Query 47: New interest viewport seed 0 at (8,10) — settlement cluster
+  Query 48: Re-query seed 0 tile(0,12) — 28% change rate
+  Query 49: New interest viewport seed 3 at (20,8) — port cluster
+  Query 50: Re-query seed 4 tile(25,12) — 22% change rate
+
+Result: 
+  - 100% map coverage across all 5 seeds
+  - 2,025 pixels observed per seed (all 15×15 tiles)
+  - 375 cells with natural 2×+ overlap from tile grid
+  - 5 extra observations on highest-value dynamic areas
+```
+
+### Visualising Coverage
+
+Run `observations_viz.py` to see your query coverage after a live round:
+
+```bash
+python observations_viz.py                                    # auto-detect latest
+python observations_viz.py data/observations_76909e29.json    # specific file
+```
+
+Produces a 5-panel figure (`observations_viz.png`) showing:
+- Initial terrain as background
+- Observation count heatmap (red = more observations)
+- Viewport rectangles with query order labels
+- Per-seed coverage statistics
+
+---
+
 ## Recommended Workflow
 
 ### First time (get on the board fast)
@@ -306,9 +510,8 @@ All models use Dropout2d (default 0.2), softmax output, and probability floor cl
 
 ## Improving Further
 
-- **Smarter query allocation** — focus viewports on dynamic areas (near settlements), not static ocean/mountain
-- **Multi-observation averaging** — query the same viewport multiple times per seed
 - **Simulation modeling** — implement growth/conflict/trade/winter mechanics to forecast outcomes
 - **Cross-seed learning** — all 5 seeds share hidden parameters; insights transfer
 - **Attention / ensemble** — spatial attention modules, or ensemble predictions from multiple architectures
 - **Accumulate training data** — every completed round adds more ground truth for offline training
+- **Learned query strategy** — train a policy to select viewport positions based on observed data
