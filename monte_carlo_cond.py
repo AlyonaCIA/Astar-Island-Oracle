@@ -774,7 +774,7 @@ def competition_score(pred, target):
 
 
 def evaluate_mc(replays, gt_data, K=DEFAULT_K_ROLLOUTS, T=DEFAULT_T_STEPS,
-                train_epochs=DEFAULT_EPOCHS):
+                train_epochs=DEFAULT_EPOCHS, use_obs=True):
     """
     Evaluate the MC approach using round k-fold:
     - For each round, train dynamics on other rounds
@@ -801,7 +801,7 @@ def evaluate_mc(replays, gt_data, K=DEFAULT_K_ROLLOUTS, T=DEFAULT_T_STEPS,
     print(f"\n{'='*60}")
     print(f"  MC Conditional Evaluation — {len(common_rounds)}-fold Round CV")
     print(f"  Rounds: {common_rounds}")
-    print(f"  K={K} rollouts, T={T} steps")
+    print(f"  K={K} rollouts, T={T} steps, obs_weighting={'ON' if use_obs else 'OFF'}")
     print(f"{'='*60}")
 
     all_scores = []
@@ -861,8 +861,8 @@ def evaluate_mc(replays, gt_data, K=DEFAULT_K_ROLLOUTS, T=DEFAULT_T_STEPS,
             width = gt_sample["width"]
             gt_tensor = np.array(ground_truth, dtype=np.float32)  # (H, W, 6)
 
-            # Get observations for this specific seed
-            seed_obs = [o for o in val_obs_all if o.get("seed_index") == seed]
+            # Get observations for this specific seed (empty if --no-obs)
+            seed_obs = [o for o in val_obs_all if o.get("seed_index") == seed] if use_obs else []
 
             # MC prediction
             print(f"\n  Round {val_rid} seed {seed}:")
@@ -910,6 +910,8 @@ def main():
     p_eval.add_argument("--steps", "-T", type=int, default=DEFAULT_T_STEPS)
     p_eval.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
                          help="Epochs for per-fold dynamics training")
+    p_eval.add_argument("--no-obs", action="store_true",
+                         help="Skip observation weighting (pure dynamics model)")
 
     args = parser.parse_args()
 
@@ -932,7 +934,7 @@ def main():
         if not replays or not gt_data:
             return
         evaluate_mc(replays, gt_data, K=args.rollouts, T=args.steps,
-                    train_epochs=args.epochs)
+                    train_epochs=args.epochs, use_obs=not args.no_obs)
 
 
 if __name__ == "__main__":
