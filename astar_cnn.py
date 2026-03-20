@@ -385,12 +385,13 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
         Query the single most dynamic viewport on each seed.
         Establishes baseline dynamism and provides cross-seed intelligence.
 
-    Phase 2 — COVERAGE (budget-dependent):
-        Use greedy entropy-weighted viewports (skip static regions).
+    Phase 2 — FULL COVERAGE (greedy ordering, ~8-9 viewports/seed):
+        Place greedy entropy-weighted viewports until the entire map is
+        covered for each seed. Orders the most important areas first, so
+        if budget runs short the least dynamic corners are the ones missed.
         Cross-seed intelligence boosts viewports near observed dynamic areas.
-        Targets ~6-7 viewports/seed (covers ~95% of scoring entropy).
 
-    Phase 3 — DEEP RESAMPLE (remaining budget):
+    Phase 3 — RESAMPLE (remaining budget):
         Re-query the most dynamic observed viewports across all seeds.
         Multiple observations per cell → better distribution estimates.
     """
@@ -439,7 +440,7 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
             raise
 
     # ── Phase 1: SCOUT — one query per seed on the most interesting viewport ──
-    print(f"  Strategy: 3-phase (scout → coverage → resample), budget {remaining}")
+    print(f"  Strategy: 3-phase (scout → full coverage → resample), budget {remaining}")
     print(f"  Phase 1: SCOUT ({seeds_count} queries)")
 
     for s in range(seeds_count):
@@ -478,31 +479,33 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
             boosted[vp["y"]:vp["y"]+vp["h"], vp["x"]:vp["x"]+vp["w"]] = 0
         boosted_interest.append(boosted)
 
-    # ── Phase 2: COVERAGE — greedy viewports, skip static areas ──
-    # Budget: reserve ~3 queries/seed for resampling in phase 3
-    resample_reserve = min(seeds_count * 3, query_limit // 3)
-    coverage_budget = query_limit - queries_done - resample_reserve
-    vps_per_seed = max(1, coverage_budget // seeds_count)
-    # Cap at 6 viewports per seed (7 total with scout = ~95% entropy coverage)
-    vps_per_seed = min(vps_per_seed, 6)
+    # ── Phase 2: FULL COVERAGE — greedy viewports until map is fully covered ──
+    # Place greedy viewports per seed until no uncovered interest remains.
+    # Typically takes 8-9 viewports per seed (with the scout = 9-10 total).
+    # Important areas are queried first thanks to greedy ordering.
+    # Reserve a small budget for resampling only if we have plenty of queries.
+    min_resample = min(seeds_count, max(0, query_limit - seeds_count * 9))
+    coverage_limit = query_limit - queries_done - min_resample
 
-    print(f"  Phase 2: COVERAGE ({vps_per_seed} viewports/seed, "
-          f"{resample_reserve} reserved for resampling)")
-
-    # Compute greedy viewports for each seed
+    # Compute greedy viewports for each seed until full coverage
+    # (enough viewports to cover the full map — typically 8-9 after scout)
+    max_vps_needed = max(1, (width * height) // (15 * 15) + 2)  # generous upper bound
     seed_coverage_vps = []
     for s in range(seeds_count):
         vps = compute_greedy_viewports(
             boosted_interest[s], width, height,
-            n_viewports=vps_per_seed, min_spacing=3
+            n_viewports=max_vps_needed, min_spacing=3
         )
         seed_coverage_vps.append(vps)
 
+    n_coverage_vps = max(len(vps) for vps in seed_coverage_vps) if seed_coverage_vps else 0
+    print(f"  Phase 2: FULL COVERAGE (up to {n_coverage_vps} viewports/seed, "
+          f"budget for coverage: {coverage_limit})")
+
     # Round-robin across seeds for fair coverage
-    max_vps = max(len(vps) for vps in seed_coverage_vps) if seed_coverage_vps else 0
-    for vp_idx in range(max_vps):
+    for vp_idx in range(n_coverage_vps):
         for s in range(seeds_count):
-            if queries_done >= query_limit - resample_reserve or past_deadline():
+            if queries_done >= query_limit - min_resample or past_deadline():
                 break
             if vp_idx >= len(seed_coverage_vps[s]):
                 continue
@@ -511,6 +514,9 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
             if exhausted:
                 _save_observations(observations, round_id)
                 return observations
+        # Check budget after each full round
+        if queries_done >= query_limit - min_resample:
+            break
 
     # ── Update cross-seed dynamism after coverage phase ──
     cross_seed_dynamism = np.zeros((height, width), dtype=np.float32)
@@ -519,7 +525,7 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
         dyn = build_observed_dynamism_heatmap(seed_obs[s], grid, width, height)
         cross_seed_dynamism += dyn
 
-    # ── Phase 3: DEEP RESAMPLE — re-query most dynamic observed viewports ──
+    # ── Phase 3: RESAMPLE — re-query most dynamic observed viewports ──
     resample_budget = query_limit - queries_done
     if resample_budget > 0 and not past_deadline():
         print(f"  Phase 3: RESAMPLE ({resample_budget} queries on most dynamic viewports)")
@@ -541,8 +547,6 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
         min_obs = min(obs_counts) if obs_counts else 0
         for s in range(seeds_count):
             if obs_counts[s] <= min_obs and cross_seed_dynamism.sum() > 0:
-                # Add a viewport centered on the peak cross-seed dynamism
-                # that hasn't been queried on this seed yet
                 extra_interest = cross_seed_dynamism.copy()
                 for obs in seed_obs[s]:
                     vp = obs["viewport"]

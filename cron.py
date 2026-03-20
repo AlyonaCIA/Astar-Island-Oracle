@@ -37,7 +37,7 @@ import train_cnn
 # Configuration
 # ---------------------------------------------------------------------------
 
-ARCH = "unet_aug"                       # MiniUNet with augmented data (dropout=0.1)
+ARCH = "unet_obs"                       # MiniUNet with observation channels (dropout=0.1)
 POLL_INTERVAL_S = 20 * 60              # 20 minutes between checks
 GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
 MAX_TRAIN_EPOCHS = 4_000               # max new epochs per training cycle
@@ -216,7 +216,7 @@ def run_pipeline():
     model, epoch = load_unet_model()
 
     if model is not None:
-        log.info(f"Loaded UNet (epoch {epoch}). Submitting predictions...")
+        log.info(f"Loaded UNet (epoch {epoch}, arch={ARCH}). Submitting predictions...")
         encoded_grids = {}
         for seed_idx in range(seeds_count):
             encoded_grids[seed_idx] = astar_cnn.encode_initial_grid(
@@ -226,6 +226,8 @@ def run_pipeline():
             astar_cnn.submit_cnn_predictions(
                 round_id, model, encoded_grids, initial_states,
                 seeds_count, width, height,
+                observations=observations,
+                arch=ARCH,
             )
             log.info("UNet predictions submitted successfully.")
         except Exception as e:
