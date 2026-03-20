@@ -335,63 +335,36 @@ def make_model(arch="quick", **kwargs):
 def collect_observations(round_id, seeds_count, initial_states, width, height):
     """
     Query the simulator using a non-overlapping tile partition with priority
-    ordering.  First spends 2 queries to detect deterministic vs stochastic
-    simulation, then applies the best strategy for each regime.
-
-    Deterministic: cover all unique tiles, no re-queries.
-    Stochastic: cover all tiles + re-query most dynamic tiles.
+    ordering.  Assumes stochastic simulation: covers all tiles via round-robin,
+    then re-queries the most dynamic tiles with any remaining budget.
     """
     budget = check_budget()
     if not budget:
-        return [], False
+        return []
     remaining = budget["queries_max"] - budget["queries_used"]
     if remaining <= 0:
         print("No queries remaining — will train on priors only.")
-        return [], False
+        return []
 
     # --- 1. Compute non-overlapping tile partition ---
     tiles = compute_tile_grid(width, height)
     n_tiles = len(tiles)
 
-    # --- 2. Detect deterministic vs stochastic ---
-    grid0 = initial_states[0]["grid"]
-    scored0 = [(score_tile(grid0, t, width, height), t) for t in tiles]
-    scored0.sort(reverse=True)
-    detect_tile = scored0[0][1]
-    dtx, dty, dtw, dth = detect_tile
-
-    print(f"\n  Detection: querying seed 0 tile ({dtx},{dty}) {dtw}x{dth} twice")
-    result1 = simulate(round_id, 0, dtx, dty, dtw, dth)
-    result2 = simulate(round_id, 0, dtx, dty, dtw, dth)
-    queries_done = 2
-
-    is_deterministic = (result1["grid"] == result2["grid"])
-    mode = "DETERMINISTIC" if is_deterministic else "STOCHASTIC"
-    print(f"  Results {'match' if is_deterministic else 'differ'} → {mode} mode")
-    print(f"  Remaining after detection: {remaining - queries_done}")
-
-    # --- 3. Per-seed priority queues ---
+    # --- 2. Per-seed priority queues ---
     seed_queues = []
     for s in range(seeds_count):
         grid = initial_states[s]["grid"]
         scored = [(score_tile(grid, t, width, height), t) for t in tiles]
         scored.sort(reverse=True)
-        if s == 0:
-            scored = [(sc, t) for sc, t in scored if t != detect_tile]
         seed_queues.append(scored)
 
-    # Record detection queries as observations for seed 0
     observations = []
     seed_obs = [[] for _ in range(seeds_count)]
-    for result in [result1, result2]:
-        vp = result["viewport"]
-        obs = {"seed_index": 0, "viewport": vp, "grid": result["grid"]}
-        observations.append(obs)
-        seed_obs[0].append(obs)
+    queries_done = 0
 
     query_limit = remaining
     total_needed = n_tiles * seeds_count
-    print(f"  Strategy ({mode}): {n_tiles} tiles/seed × {seeds_count} seeds = "
+    print(f"  Strategy (STOCHASTIC): {n_tiles} tiles/seed × {seeds_count} seeds = "
           f"{total_needed} for full coverage  (budget {remaining})")
 
     # --- 4. Round-robin with re-ranking ---
@@ -442,21 +415,21 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
                 if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
                     print("  Budget exhausted!")
                     _save_observations(observations, round_id)
-                    return observations, is_deterministic
+                    return observations
 
             except requests.HTTPError as e:
                 if e.response is not None and e.response.status_code == 429:
                     print(f"  Rate limited at seed {s}")
                     _save_observations(observations, round_id)
-                    return observations, is_deterministic
+                    return observations
                 raise
 
         if not queried_any:
             break
         round_num += 1
 
-    # --- 5. Extra queries (stochastic mode only) ---
-    if not is_deterministic and queries_done < query_limit and not past_deadline():
+    # --- 4. Extra queries on most dynamic tiles ---
+    if queries_done < query_limit and not past_deadline():
         print(f"  Full coverage done ({queries_done} queries). "
               f"Using {query_limit - queries_done} extra queries on dynamic tiles.")
         extra_targets = []
@@ -501,12 +474,9 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
                 if e.response is not None and e.response.status_code == 429:
                     break
                 raise
-    elif is_deterministic and queries_done < query_limit:
-        print(f"  Full coverage done ({queries_done} queries). "
-              f"{query_limit - queries_done} queries unused (deterministic — no benefit).")
 
     _save_observations(observations, round_id)
-    return observations, is_deterministic
+    return observations
 
 
 def _save_observations(observations, round_id):
@@ -925,7 +895,7 @@ def main():
     try:
         # Step 4: Always collect observations (saved to disk for future training)
         print(f"\n--- Collecting observations ({time_remaining():.0f}s remaining) ---")
-        observations, is_deterministic = collect_observations(
+        observations = collect_observations(
             round_id, seeds_count, initial_states, width, height
         )
 
