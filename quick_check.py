@@ -86,23 +86,27 @@ REPLAY_DIR = os.path.join(SCRIPT_DIR, "simulation_replays")
 # STEP 0 — Fetch fresh data from API
 # ===================================================================
 
+API_TIMEOUT = 30  # seconds per request
+
+
 def fetch_rounds():
     """GET /rounds — list all rounds."""
-    resp = session.get(f"{BASE_URL}/rounds")
+    resp = session.get(f"{BASE_URL}/rounds", timeout=API_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 
 def fetch_round_details(round_id):
     """GET /rounds/{round_id} — initial states + dimensions."""
-    resp = session.get(f"{BASE_URL}/rounds/{round_id}")
+    resp = session.get(f"{BASE_URL}/rounds/{round_id}", timeout=API_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 
 def fetch_analysis(round_id, seed_index):
     """GET /analysis/{round_id}/{seed_index} — ground truth comparison."""
-    resp = session.get(f"{BASE_URL}/analysis/{round_id}/{seed_index}")
+    resp = session.get(f"{BASE_URL}/analysis/{round_id}/{seed_index}",
+                       timeout=API_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -118,6 +122,7 @@ def refresh_ground_truth():
     log.info("Fetching rounds list from API...")
     t0 = time.time()
     rounds = fetch_rounds()
+    time.sleep(1.0)
     completed = [r for r in rounds if r["status"] in ("completed", "scoring")]
     log.info(f"  Found {len(completed)} completed/scoring rounds "
              f"(of {len(rounds)} total) in {time.time()-t0:.1f}s")
@@ -132,13 +137,16 @@ def refresh_ground_truth():
         seeds_count = rnd.get("seeds_count", 5)
         round_key = round_id[:8]
 
+        log.info(f"  Round #{round_num} ({round_key}) — {seeds_count} seeds...")
+
         # Also fetch round details for initial_states
         try:
             detail = fetch_round_details(round_id)
-            time.sleep(1.0)
         except Exception as e:
             log.warning(f"  Could not fetch details for round #{round_num}: {e}")
             detail = None
+        finally:
+            time.sleep(1.0)  # always sleep between API calls
 
         for seed_idx in range(seeds_count):
             fname = f"r{round_num}_s{seed_idx}_{round_key}.json"
@@ -147,18 +155,21 @@ def refresh_ground_truth():
             # Always re-fetch to ensure freshness
             try:
                 analysis = fetch_analysis(round_id, seed_idx)
-                time.sleep(1.0)
             except requests.HTTPError as e:
+                time.sleep(1.0)
                 if e.response is not None and e.response.status_code == 400:
                     skipped += 1
-                    continue
-                log.warning(f"  Analysis fetch failed for r{round_num} s{seed_idx}: {e}")
-                skipped += 1
+                    log.info(f"  Skipped r{round_num} s{seed_idx} (HTTP 400)")
+                else:
+                    log.warning(f"  Analysis fetch failed for r{round_num} s{seed_idx}: {e}")
+                    skipped += 1
                 continue
             except Exception as e:
+                time.sleep(1.0)
                 log.warning(f"  Analysis fetch failed for r{round_num} s{seed_idx}: {e}")
                 skipped += 1
                 continue
+            time.sleep(1.0)
 
             # Build GT record
             gt_record = {
