@@ -37,7 +37,7 @@ import train_cnn
 # Configuration
 # ---------------------------------------------------------------------------
 
-ARCH = "unet_obs"                       # MiniUNet with observation channels (dropout=0.1)
+ARCH = "unet_v2"                        # MiniUNetV2 with self-attention + cross-seed obs
 POLL_INTERVAL_S = 20 * 60              # 20 minutes between checks
 GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
 MAX_TRAIN_EPOCHS = 4_000               # max new epochs per training cycle
@@ -211,12 +211,22 @@ def run_pipeline():
     else:
         log.info("Budget already spent. Skipping observation collection.")
 
-    # --- 7. Load UNet and submit predictions ---
-    log.info("--- Loading UNet checkpoint ---")
+    # --- 7. Load model(s) and submit predictions ---
+    log.info("--- Loading model checkpoint(s) ---")
     model, epoch = load_unet_model()
 
+    # Try loading snapshot ensemble (last 3 checkpoints)
+    ensemble_models = None
+    try:
+        snapshots = astar_cnn.load_snapshot_ensemble(arch=ARCH, n_snapshots=3)
+        if len(snapshots) > 1:
+            ensemble_models = snapshots
+            log.info(f"Loaded {len(snapshots)}-model snapshot ensemble")
+    except Exception as e:
+        log.warning(f"Snapshot ensemble loading failed: {e}")
+
     if model is not None:
-        log.info(f"Loaded UNet (epoch {epoch}, arch={ARCH}). Submitting predictions...")
+        log.info(f"Loaded model (epoch {epoch}, arch={ARCH}). Submitting predictions...")
         encoded_grids = {}
         for seed_idx in range(seeds_count):
             encoded_grids[seed_idx] = astar_cnn.encode_initial_grid(
@@ -228,14 +238,15 @@ def run_pipeline():
                 seeds_count, width, height,
                 observations=observations,
                 arch=ARCH,
+                ensemble_models=ensemble_models,
             )
-            log.info("UNet predictions submitted successfully.")
+            log.info("Predictions submitted successfully.")
         except Exception as e:
-            log.error(f"UNet submission failed: {e}")
+            log.error(f"Submission failed: {e}")
             log.info("Prior-based fallback still stands.")
     else:
         log.warning(
-            f"No UNet checkpoint found in "
+            f"No checkpoint found in "
             f"{train_cnn.get_checkpoint_dir(ARCH)}. Fallback stands."
         )
 
@@ -275,14 +286,14 @@ def retrain():
         return
 
     log.info(f"Training data: {len(all_data)} samples (all rounds/seeds)")
-    log.info(f"Resetting checkpoints — training from epoch 0 to {MAX_TRAIN_EPOCHS}")
+    log.info(f"Resuming training up to {MAX_TRAIN_EPOCHS} new epochs")
 
-    # 2. Train from scratch with all data (augmentation applied inside train())
+    # 2. Resume training with all data (augmentation applied inside train())
     original_epochs = train_cnn.EPOCHS
     train_cnn.EPOCHS = MAX_TRAIN_EPOCHS
 
     try:
-        train_cnn.train(all_data, reset=True, forever=False, arch=ARCH)
+        train_cnn.train(all_data, reset=False, forever=False, arch=ARCH, cv="round")
     except KeyboardInterrupt:
         raise  # propagate to outer loop
     except Exception as e:

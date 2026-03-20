@@ -348,6 +348,101 @@ class MiniUNet(nn.Module):
         return probs
 
 
+XSEED_OBS_CHANNELS = 7  # 6 cross-seed class frequencies + 1 cross-seed coverage
+
+
+def encode_cross_seed_obs_channels(all_observations, current_seed, width, height):
+    """
+    Encode observations from OTHER seeds into 7 channels.
+    Since hidden parameters are shared across seeds, observations from any
+    seed inform predictions for all seeds.
+
+    Returns: (7, height, width) numpy array — same format as encode_obs_channels.
+    """
+    other_obs = [o for o in all_observations if o["seed_index"] != current_seed]
+    return encode_obs_channels(other_obs, width, height)
+
+
+class MiniUNetV2(nn.Module):
+    """
+    MiniUNet with self-attention at the bottleneck and support for cross-seed
+    observation channels.
+
+    Input: 28 channels = 14 terrain + 7 own-seed obs + 7 cross-seed obs
+    Self-attention at 10x10 bottleneck (100 tokens) enables long-range
+    spatial reasoning (e.g. faction expansion patterns).
+    """
+    def __init__(self, dropout=0.1, in_channels=14 + OBS_CHANNELS + XSEED_OBS_CHANNELS,
+                 attn_heads=4):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+        )
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.pool2 = nn.MaxPool2d(2)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
+        )
+        # Self-attention at bottleneck (10x10 = 100 tokens for 40x40 maps)
+        self.attn = nn.MultiheadAttention(128, attn_heads, batch_first=True)
+        self.attn_norm = nn.LayerNorm(128)
+        # Decoder
+        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+        )
+        self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
+
+    def forward(self, x):
+        _, _, H, W = x.shape
+        pad_h = (2 - H % 2) % 2
+        pad_w = (2 - W % 2) % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        b = self.bottleneck(self.pool2(e2))
+
+        # Self-attention at bottleneck
+        B, C, bH, bW = b.shape
+        tokens = b.flatten(2).permute(0, 2, 1)   # (B, bH*bW, C)
+        attn_out, _ = self.attn(tokens, tokens, tokens)
+        tokens = self.attn_norm(tokens + attn_out)  # residual + LayerNorm
+        b = tokens.permute(0, 2, 1).reshape(B, C, bH, bW)
+
+        d2 = self.up2(b)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        logits = self.out_conv(d1)
+
+        if pad_h or pad_w:
+            logits = logits[:, :, :H, :W]
+
+        probs = F.softmax(logits, dim=1)
+        probs = torch.clamp(probs, min=PROB_FLOOR)
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        return probs
+
+
 MODEL_REGISTRY = {
     "quick": QuickCNN,
     "quick3": QuickCNN3,
@@ -355,6 +450,9 @@ MODEL_REGISTRY = {
     "unet_aug": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1)),
     "unet_obs": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1),
                                        in_channels=14 + OBS_CHANNELS),
+    "unet_v2": lambda **kw: MiniUNetV2(
+        dropout=kw.get('dropout', 0.1),
+        in_channels=14 + OBS_CHANNELS + XSEED_OBS_CHANNELS),
 }
 
 CHECKPOINT_DIR_MAP = {
@@ -363,6 +461,7 @@ CHECKPOINT_DIR_MAP = {
     "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
     "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
     "unet_obs": os.path.join(SCRIPT_DIR, "checkpoints_unet_obs"),
+    "unet_v2": os.path.join(SCRIPT_DIR, "checkpoints_unet_v2"),
 }
 
 MODEL_ARCH = os.environ.get("ASTAR_MODEL", "quick")
@@ -479,28 +578,28 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
             boosted[vp["y"]:vp["y"]+vp["h"], vp["x"]:vp["x"]+vp["w"]] = 0
         boosted_interest.append(boosted)
 
-    # ── Phase 2: FULL COVERAGE — greedy viewports until map is fully covered ──
-    # Place greedy viewports per seed until no uncovered interest remains.
-    # Typically takes 8-9 viewports per seed (with the scout = 9-10 total).
-    # Important areas are queried first thanks to greedy ordering.
-    # Reserve a small budget for resampling only if we have plenty of queries.
-    min_resample = min(seeds_count, max(0, query_limit - seeds_count * 9))
-    coverage_limit = query_limit - queries_done - min_resample
+    # ── Phase 2: DYNAMIC COVERAGE — greedy viewports on non-static areas ──
+    # Skip static tiles (mostly ocean/mountain) since they don't contribute
+    # to scoring. Reserve ≥40% of remaining budget for Phase 3 resampling
+    # to build better empirical distributions on dynamic cells.
+    remaining_after_scout = query_limit - queries_done
+    min_resample = max(seeds_count, int(0.4 * remaining_after_scout))
+    coverage_limit = remaining_after_scout - min_resample
 
-    # Compute greedy viewports for each seed until full coverage
-    # (enough viewports to cover the full map — typically 8-9 after scout)
-    max_vps_needed = max(1, (width * height) // (15 * 15) + 2)  # generous upper bound
+    # Compute greedy viewports per seed — min_score=15 skips static-heavy tiles
+    max_vps_needed = max(1, (width * height) // (15 * 15) + 2)
     seed_coverage_vps = []
     for s in range(seeds_count):
         vps = compute_greedy_viewports(
             boosted_interest[s], width, height,
-            n_viewports=max_vps_needed, min_spacing=3
+            n_viewports=max_vps_needed, min_spacing=3,
+            min_score=15.0
         )
         seed_coverage_vps.append(vps)
 
     n_coverage_vps = max(len(vps) for vps in seed_coverage_vps) if seed_coverage_vps else 0
-    print(f"  Phase 2: FULL COVERAGE (up to {n_coverage_vps} viewports/seed, "
-          f"budget for coverage: {coverage_limit})")
+    print(f"  Phase 2: DYNAMIC COVERAGE (up to {n_coverage_vps} viewports/seed, "
+          f"budget for coverage: {coverage_limit}, reserved for resample: {min_resample})")
 
     # Round-robin across seeds for fair coverage
     for vp_idx in range(n_coverage_vps):
@@ -724,12 +823,14 @@ def build_interest_heatmap(initial_grid, width, height):
 
 
 def compute_greedy_viewports(interest, width, height, n_viewports,
-                             max_tile=15, min_spacing=5):
+                             max_tile=15, min_spacing=5, min_score=15.0):
     """
     Greedily place viewports to maximize total covered interest.
 
     At each step, picks the 15×15 viewport position that maximizes
     *uncovered* interest, then marks those cells as covered.
+    Stops when the best remaining viewport has interest below min_score
+    (skips predominantly static tiles like ocean/mountain).
     Returns list of (x, y, w, h) tuples.
     """
     # Summed area table for fast viewport scoring
@@ -765,7 +866,7 @@ def compute_greedy_viewports(interest, width, height, n_viewports,
                         best_score = score
                         best_pos = (vx, vy)
 
-        if best_score <= 0:
+        if best_score <= min_score:
             break
         vx, vy = best_pos
         selected.append((vx, vy, max_tile, max_tile))
@@ -986,6 +1087,139 @@ def predict_full_map(model, features, width, height, obs_features=None):
     return probs
 
 
+# --- Ensemble Prediction ---
+
+def load_snapshot_ensemble(arch=None, n_snapshots=5):
+    """
+    Load the last N checkpoint snapshots for snapshot ensemble.
+    Returns list of (model, epoch) tuples.
+    """
+    a = arch or MODEL_ARCH
+    ckpt_dir = CHECKPOINT_DIR_MAP.get(a, CHECKPOINT_DIR)
+    if not os.path.isdir(ckpt_dir):
+        return []
+
+    files = [f for f in os.listdir(ckpt_dir)
+             if f.startswith("cnn_epoch_") and f.endswith(".pt")]
+    if not files:
+        return []
+
+    files.sort(key=lambda f: int(f.replace("cnn_epoch_", "").replace(".pt", "")),
+               reverse=True)
+    files = files[:n_snapshots]
+
+    models = []
+    for fname in files:
+        path = os.path.join(ckpt_dir, fname)
+        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+        model_arch = ckpt.get("model_arch") or ckpt.get("metadata", {}).get("model_arch", a)
+        model = make_model(model_arch).to(DEVICE)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+        epoch = ckpt.get("epoch", 0)
+        models.append((model, epoch))
+
+    print(f"  Loaded {len(models)} snapshot models: "
+          f"epochs {[e for _, e in models]}")
+    return models
+
+
+def ensemble_predict(models, features, width, height, obs_features=None,
+                     xseed_features=None, temperature=1.0):
+    """
+    Average predictions from multiple models (snapshot ensemble).
+    Optionally applies temperature scaling before averaging.
+
+    Args:
+        models: list of (model, epoch) tuples
+        features: (14, H, W) terrain features
+        obs_features: optional (7, H, W) own-seed observations
+        xseed_features: optional (7, H, W) cross-seed observations
+        temperature: softmax temperature (>1 = softer, <1 = sharper)
+
+    Returns: (H, W, 6) ensemble-averaged probability predictions
+    """
+    if not models:
+        return None
+
+    all_logits = []
+    with torch.no_grad():
+        for model, _ in models:
+            parts = [features]
+            if obs_features is not None:
+                parts.append(obs_features)
+            if xseed_features is not None:
+                parts.append(xseed_features)
+            x = np.concatenate(parts, axis=0)
+            x_t = torch.tensor(x).unsqueeze(0).to(DEVICE)
+            # Get raw logits by running through model but extracting before softmax
+            # Since our models apply softmax internally, we work with log-probs
+            probs = model(x_t).squeeze(0)  # (6, H, W)
+            all_logits.append(probs)
+
+    # Average probabilities (with optional temperature scaling)
+    stacked = torch.stack(all_logits, dim=0)  # (K, 6, H, W)
+    if temperature != 1.0:
+        # Apply temperature to log-probabilities, then re-softmax
+        log_probs = torch.log(torch.clamp(stacked, min=1e-8))
+        scaled = F.softmax(log_probs / temperature, dim=1)
+        avg_probs = scaled.mean(dim=0)
+    else:
+        avg_probs = stacked.mean(dim=0)
+
+    result = avg_probs.permute(1, 2, 0).cpu().numpy()
+    result = np.maximum(result, PROB_FLOOR)
+    result = result / result.sum(axis=-1, keepdims=True)
+    return result
+
+
+def learn_temperature(models, features_list, targets_list, width, height,
+                      obs_features_list=None, xseed_features_list=None):
+    """
+    Learn optimal temperature T that minimizes KL divergence on validation data.
+    Uses simple grid search over [0.5, 2.0].
+
+    Args:
+        models: list of (model, epoch) tuples
+        features_list: list of (C, H, W) feature arrays
+        targets_list: list of (H, W, 6) ground truth probability arrays
+        obs_features_list: optional list of (7, H, W) observation arrays
+        xseed_features_list: optional list of (7, H, W) cross-seed obs arrays
+
+    Returns: optimal temperature (float)
+    """
+    if not models or not features_list:
+        return 1.0
+
+    best_t = 1.0
+    best_kl = float("inf")
+
+    for t in [0.5, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.5, 2.0]:
+        total_kl = 0.0
+        for i, (feat, target) in enumerate(zip(features_list, targets_list)):
+            obs_f = obs_features_list[i] if obs_features_list else None
+            xs_f = xseed_features_list[i] if xseed_features_list else None
+            pred = ensemble_predict(models, feat, width, height,
+                                    obs_features=obs_f, xseed_features=xs_f,
+                                    temperature=t)
+            # KL divergence
+            p = np.clip(target, 1e-8, None)
+            q = np.clip(pred, 1e-8, None)
+            kl = (p * (np.log(p) - np.log(q))).sum(axis=-1)
+            ent = -(p * np.log(p)).sum(axis=-1)
+            total_ent = ent.sum()
+            if total_ent > 1e-12:
+                total_kl += (kl * ent).sum() / total_ent
+
+        avg_kl = total_kl / max(len(features_list), 1)
+        if avg_kl < best_kl:
+            best_kl = avg_kl
+            best_t = t
+
+    print(f"  Optimal temperature: {best_t:.1f} (wKL={best_kl:.6f})")
+    return best_t
+
+
 # --- Bayesian Blending ---
 
 def bayesian_blend(cnn_pred, observations, initial_grid, width, height,
@@ -1103,13 +1337,23 @@ def submit_fallback(round_id, seeds_count, initial_states, width, height):
 
 def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
                            seeds_count, width, height,
-                           observations=None, arch=None):
+                           observations=None, arch=None,
+                           ensemble_models=None, temperature=1.0):
     """Submit CNN-based predictions for all seeds (overwrites fallback).
 
-    For unet_obs architecture, observations are encoded as extra input channels.
+    For unet_obs/unet_v2 architectures, observations are encoded as input channels.
+    If ensemble_models is provided, uses snapshot ensemble averaging.
     """
-    is_obs_model = (arch == "unet_obs")
-    label = "obs-conditioned CNN" if is_obs_model and observations else "CNN"
+    is_obs_model = arch in ("unet_obs", "unet_v2")
+    is_v2 = (arch == "unet_v2")
+    use_ensemble = ensemble_models and len(ensemble_models) > 1
+
+    if use_ensemble:
+        label = f"ensemble ({len(ensemble_models)} snapshots, T={temperature:.1f})"
+    elif is_obs_model and observations:
+        label = "obs-conditioned CNN"
+    else:
+        label = "CNN"
     print(f"\n--- Submitting {label} predictions ---")
 
     # Group observations by seed
@@ -1129,14 +1373,31 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
             )
         features = encoded_grids[seed_idx]
 
-        # Build observation channels for obs-conditioned model
+        # Build observation channels
         obs_feat = None
+        xseed_feat = None
         if is_obs_model:
             seed_obs = obs_by_seed.get(seed_idx, [])
             obs_feat = encode_obs_channels(seed_obs, width, height)
+        if is_v2 and observations:
+            xseed_feat = encode_cross_seed_obs_channels(
+                observations, seed_idx, width, height)
 
-        prediction = predict_full_map(model, features, width, height,
-                                      obs_features=obs_feat)
+        if use_ensemble:
+            prediction = ensemble_predict(
+                ensemble_models, features, width, height,
+                obs_features=obs_feat, xseed_features=xseed_feat,
+                temperature=temperature)
+        else:
+            # Build combined features for single-model prediction
+            all_feat = obs_feat
+            if is_v2 and xseed_feat is not None:
+                if all_feat is not None:
+                    all_feat = np.concatenate([obs_feat, xseed_feat], axis=0)
+                else:
+                    all_feat = xseed_feat
+            prediction = predict_full_map(model, features, width, height,
+                                          obs_features=all_feat)
 
         try:
             result = submit_prediction(round_id, seed_idx, prediction)

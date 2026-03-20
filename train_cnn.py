@@ -15,6 +15,7 @@ import sys
 import time
 import json
 import math
+import random
 import argparse
 import datetime
 import functools
@@ -383,6 +384,88 @@ class MiniUNet(nn.Module):
 
 
 OBS_CHANNELS = 7  # 6 class frequencies + 1 coverage
+XSEED_OBS_CHANNELS = 7  # 6 cross-seed class frequencies + 1 cross-seed coverage
+
+
+class MiniUNetV2(nn.Module):
+    """
+    MiniUNet with self-attention at the bottleneck and support for cross-seed
+    observation channels.
+
+    Input: 28 channels = 14 terrain + 7 own-seed obs + 7 cross-seed obs
+    Self-attention at 10x10 bottleneck (100 tokens) enables long-range
+    spatial reasoning (e.g. faction expansion patterns).
+    """
+    def __init__(self, dropout=0.1, in_channels=14 + OBS_CHANNELS + XSEED_OBS_CHANNELS,
+                 attn_heads=4):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+        )
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.pool2 = nn.MaxPool2d(2)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
+        )
+        # Self-attention at bottleneck (10x10 = 100 tokens for 40x40 maps)
+        self.attn = nn.MultiheadAttention(128, attn_heads, batch_first=True)
+        self.attn_norm = nn.LayerNorm(128)
+        # Decoder
+        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+        )
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+        )
+        self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
+
+    def forward(self, x):
+        _, _, H, W = x.shape
+        pad_h = (2 - H % 2) % 2
+        pad_w = (2 - W % 2) % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        b = self.bottleneck(self.pool2(e2))
+
+        # Self-attention at bottleneck
+        B, C, bH, bW = b.shape
+        tokens = b.flatten(2).permute(0, 2, 1)   # (B, bH*bW, C)
+        attn_out, _ = self.attn(tokens, tokens, tokens)
+        tokens = self.attn_norm(tokens + attn_out)  # residual + LayerNorm
+        b = tokens.permute(0, 2, 1).reshape(B, C, bH, bW)
+
+        d2 = self.up2(b)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        logits = self.out_conv(d1)
+
+        if pad_h or pad_w:
+            logits = logits[:, :, :H, :W]
+
+        probs = F.softmax(logits, dim=1)
+        probs = torch.clamp(probs, min=PROB_FLOOR)
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        return probs
+
 
 # Registry for model selection
 MODEL_REGISTRY = {
@@ -391,6 +474,8 @@ MODEL_REGISTRY = {
     "unet": MiniUNet,
     "unet_aug": functools.partial(MiniUNet, dropout=0.1),
     "unet_obs": functools.partial(MiniUNet, dropout=0.1, in_channels=14 + OBS_CHANNELS),
+    "unet_v2": functools.partial(MiniUNetV2, dropout=0.1,
+                                  in_channels=14 + OBS_CHANNELS + XSEED_OBS_CHANNELS),
 }
 
 # Separate checkpoint dirs per architecture
@@ -400,6 +485,7 @@ CHECKPOINT_DIR_MAP = {
     "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
     "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
     "unet_obs": os.path.join(SCRIPT_DIR, "checkpoints_unet_obs"),
+    "unet_v2": os.path.join(SCRIPT_DIR, "checkpoints_unet_v2"),
 }
 
 
@@ -689,6 +775,80 @@ def build_fullmap_datasets_obs(all_data, val_quadrant=3):
     return features_list, targets_list, train_masks, val_masks, meta
 
 
+def _encode_cross_seed_obs(all_obs, current_seed, width, height):
+    """Encode observations from OTHER seeds into 7 channels."""
+    other_obs = [o for o in all_obs if o.get("seed_index") != current_seed]
+    return encode_obs_channels(other_obs, width, height)
+
+
+def build_fullmap_datasets_v2(all_data, val_quadrant=3):
+    """
+    Build full-map datasets for unet_v2 training.
+
+    Features: 28 channels = 14 terrain + 7 own-seed obs + 7 cross-seed obs
+    For seeds without observations: all 14 obs channels are zeros.
+
+    Returns same structure as build_fullmap_datasets.
+    """
+    features_list, targets_list = [], []
+    train_masks, val_masks = [], []
+    meta = []
+
+    obs_cache = {}
+
+    for data in all_data:
+        initial_grid = data.get("initial_grid")
+        ground_truth = data.get("ground_truth")
+        if initial_grid is None or ground_truth is None:
+            continue
+
+        width = data["width"]
+        height = data["height"]
+        seed_idx = data.get("_seed_index", 0)
+        round_id = data.get("_round_id", "")
+        round_id_short = round_id[:8] if round_id else ""
+
+        # Terrain features (14, H, W)
+        terrain_feat = encode_initial_grid(initial_grid, width, height)
+
+        # Load observations for this round (cached)
+        if round_id_short not in obs_cache:
+            obs_cache[round_id_short] = _load_obs_for_round(round_id_short)
+        all_obs = obs_cache[round_id_short]
+
+        # Own-seed observation channels (7, H, W)
+        seed_obs = [o for o in all_obs if o.get("seed_index") == seed_idx]
+        obs_feat = encode_obs_channels(seed_obs, width, height)
+
+        # Cross-seed observation channels (7, H, W)
+        xseed_feat = _encode_cross_seed_obs(all_obs, seed_idx, width, height)
+
+        # Concatenate: (28, H, W)
+        features = np.concatenate([terrain_feat, obs_feat, xseed_feat], axis=0)
+
+        gt = np.array(ground_truth, dtype=np.float32).transpose(2, 0, 1)
+        tmask, vmask = quadrant_masks(height, width, val_quadrant)
+
+        features_list.append(features)
+        targets_list.append(gt)
+        train_masks.append(tmask)
+        val_masks.append(vmask)
+        meta.append({
+            "round": data.get("_round_number"),
+            "seed": seed_idx,
+            "score": data.get("score"),
+            "has_obs": len(seed_obs) > 0,
+            "n_obs": len(seed_obs),
+            "n_xseed_obs": len(all_obs) - len(seed_obs),
+        })
+
+    n_with_obs = sum(1 for m in meta if m["has_obs"])
+    n_with_xs = sum(1 for m in meta if m.get("n_xseed_obs", 0) > 0)
+    print(f"  Full maps: {len(features_list)} "
+          f"({n_with_obs} with own obs, {n_with_xs} with cross-seed obs)")
+    return features_list, targets_list, train_masks, val_masks, meta
+
+
 # ---------------------------------------------------------------------------
 # Loss: KL divergence (same metric used for scoring)
 # ---------------------------------------------------------------------------
@@ -794,16 +954,20 @@ def _clear_checkpoints(ckpt_dir=None):
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(all_data, reset=False, forever=False, arch="quick"):
+def train(all_data, reset=False, forever=False, arch="quick", cv="quadrant"):
     ckpt_dir = get_checkpoint_dir(arch)
 
+    cv_label = "leave-one-round-out" if cv == "round" else "4-fold quadrant"
     print(f"\n{'='*60}")
-    print(f"  Building datasets (4-fold quadrant cross-validation)")
+    print(f"  Building datasets ({cv_label} cross-validation)")
     print(f"  Architecture: {arch}")
     print(f"{'='*60}")
 
-    # Build datasets — unet_obs uses observation-conditioned features (21 ch)
-    if arch == "unet_obs":
+    # Build datasets — choose encoding based on architecture
+    if arch == "unet_v2":
+        features_list, targets_list, _, _, meta = \
+            build_fullmap_datasets_v2(all_data, val_quadrant=0)
+    elif arch == "unet_obs":
         features_list, targets_list, _, _, meta = \
             build_fullmap_datasets_obs(all_data, val_quadrant=0)
     else:
@@ -815,7 +979,7 @@ def train(all_data, reset=False, forever=False, arch="quick"):
         return
 
     # Apply rotation/flip augmentation for augmented architectures
-    if arch in ("unet_aug", "unet_obs"):
+    if arch in ("unet_aug", "unet_obs", "unet_v2"):
         features_list, targets_list, meta = augment_maps(
             features_list, targets_list, meta)
 
@@ -826,17 +990,42 @@ def train(all_data, reset=False, forever=False, arch="quick"):
     N, _, H, W = X.shape
 
     # Pre-build (H, W) masks for all 4 folds
-    fold_masks = []  # list of (train_hw, val_hw) tuples
-    for q in range(4):
-        t_np, v_np = quadrant_masks(H, W, val_quadrant=q)
-        fold_masks.append((
-            torch.tensor(t_np, device=DEVICE),
-            torch.tensor(v_np, device=DEVICE),
-        ))
+    # --- Build cross-validation folds ---
+    use_obs_dropout = arch in ("unet_obs", "unet_v2")
+    obs_ch_start = 14  # observation channels start at index 14
 
-    pix_per_q = (H // 2) * (W // 2) * N
-    print(f"  Tensors: X={list(X.shape)}, Y={list(Y.shape)}")
-    print(f"  4-fold CV: {pix_per_q * 3} train / {pix_per_q} val pixels per fold")
+    if cv == "round":
+        # Leave-one-round-out: hold out maps from the most recent round
+        round_nums = sorted(set(m["round"] for m in meta if m["round"] is not None))
+        if len(round_nums) < 2:
+            print("  WARNING: Only 1 round available, falling back to quadrant CV")
+            cv = "quadrant"
+
+    if cv == "round":
+        val_round = round_nums[-1]  # most recent round = validation
+        val_idx = [i for i, m in enumerate(meta) if m["round"] == val_round]
+        train_idx = [i for i, m in enumerate(meta) if m["round"] != val_round]
+        print(f"  Tensors: X={list(X.shape)}, Y={list(Y.shape)}")
+        print(f"  Leave-one-round-out: val=round {val_round} ({len(val_idx)} maps), "
+              f"train={len(train_idx)} maps")
+
+        X_train = X[train_idx]
+        Y_train = Y[train_idx]
+        X_val = X[val_idx]
+        Y_val = Y[val_idx]
+        fold_masks = None
+    else:
+        # 4-fold quadrant cross-validation (original behavior)
+        fold_masks = []  # list of (train_hw, val_hw) tuples
+        for q in range(4):
+            t_np, v_np = quadrant_masks(H, W, val_quadrant=q)
+            fold_masks.append((
+                torch.tensor(t_np, device=DEVICE),
+                torch.tensor(v_np, device=DEVICE),
+            ))
+        pix_per_q = (H // 2) * (W // 2) * N
+        print(f"  Tensors: X={list(X.shape)}, Y={list(Y.shape)}")
+        print(f"  4-fold CV: {pix_per_q * 3} train / {pix_per_q} val pixels per fold")
 
     # Model & optimizer
     model = make_model(arch).to(DEVICE)
@@ -865,15 +1054,18 @@ def train(all_data, reset=False, forever=False, arch="quick"):
     print(f"  Checkpoint every {CHECKPOINT_EVERY} epochs → {ckpt_dir}")
     print()
 
-    # Dataset / DataLoader for map-level batching (masks applied per-fold)
-    dataset = TensorDataset(X, Y)
+    # Dataset / DataLoader for map-level batching
+    if cv == "round":
+        dataset = TensorDataset(X_train, Y_train)
+    else:
+        dataset = TensorDataset(X, Y)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     metadata = {
         "model_arch": arch,
         "num_maps": N,
         "map_size": f"{H}x{W}",
-        "cross_validation": "4-fold quadrant",
+        "cross_validation": cv_label,
         "rounds": [m["round"] for m in meta],
         "lr": LR,
         "start_time": datetime.datetime.now().isoformat(),
@@ -901,6 +1093,36 @@ def train(all_data, reset=False, forever=False, arch="quick"):
     avg_train = 0.0
     val_loss = float("inf")
 
+    def _apply_obs_dropout(X_b):
+        """
+        Randomly mask observation channels during training to teach the model
+        to handle varying observation coverage:
+        - 30% chance: zero ALL obs channels (pure terrain fallback)
+        - 35% chance: keep only random rectangular viewports
+        - 35% chance: keep all observations unchanged
+        """
+        if not use_obs_dropout:
+            return X_b
+        B_sz = X_b.shape[0]
+        X_b = X_b.clone()
+        for i in range(B_sz):
+            r = random.random()
+            if r < 0.3:
+                # Zero all observation channels (model must fall back to terrain)
+                X_b[i, obs_ch_start:, :, :] = 0
+            elif r < 0.65:
+                # Keep only random rectangular regions (simulate partial coverage)
+                mask = torch.zeros(1, H, W, device=DEVICE)
+                n_vps = random.randint(1, 6)
+                for _ in range(n_vps):
+                    rx = random.randint(0, max(0, W - 15))
+                    ry = random.randint(0, max(0, H - 15))
+                    rw = random.randint(5, 15)
+                    rh = random.randint(5, 15)
+                    mask[0, ry:ry+rh, rx:rx+rw] = 1.0
+                X_b[i, obs_ch_start:, :, :] *= mask
+        return X_b
+
     try:
         for epoch in _epoch_iter():
             last_epoch = epoch
@@ -909,30 +1131,52 @@ def train(all_data, reset=False, forever=False, arch="quick"):
             epoch_val_loss = 0.0
             total_train_batches = 0
 
-            # --- 4-fold cross-validation ---
-            for t_hw, v_hw in fold_masks:
-                # Train on 3 quadrants
+            if cv == "round":
+                # --- Leave-one-round-out: train on all train maps, validate on val maps ---
                 for X_b, Y_b in loader:
                     B = X_b.shape[0]
-                    Tm_b = t_hw.unsqueeze(0).expand(B, -1, -1)
+                    X_b = _apply_obs_dropout(X_b)
                     optimizer.zero_grad()
-                    pred = model(X_b)  # (B, 6, H, W)
-                    loss = kl_divergence_loss(pred, Y_b, mask=Tm_b)
+                    pred = model(X_b)
+                    loss = kl_divergence_loss(pred, Y_b, mask=None)
                     loss.backward()
                     optimizer.step()
                     epoch_train_loss += loss.item()
                     total_train_batches += 1
 
-                # Validate on held-out quadrant (dropout OFF, like simple CNN)
+                # Validate on held-out round
                 model.eval()
                 with torch.no_grad():
-                    V_full = v_hw.unsqueeze(0).expand(N, -1, -1)
-                    pred_all = model(X)
-                    epoch_val_loss += kl_divergence_loss(pred_all, Y, mask=V_full).item()
+                    pred_val = model(X_val)
+                    epoch_val_loss = kl_divergence_loss(pred_val, Y_val, mask=None).item()
                 model.train()
 
-            avg_train = epoch_train_loss / max(total_train_batches, 1)
-            val_loss = epoch_val_loss / 4
+                avg_train = epoch_train_loss / max(total_train_batches, 1)
+                val_loss = epoch_val_loss
+            else:
+                # --- 4-fold quadrant cross-validation ---
+                for t_hw, v_hw in fold_masks:
+                    for X_b, Y_b in loader:
+                        B = X_b.shape[0]
+                        X_b = _apply_obs_dropout(X_b)
+                        Tm_b = t_hw.unsqueeze(0).expand(B, -1, -1)
+                        optimizer.zero_grad()
+                        pred = model(X_b)
+                        loss = kl_divergence_loss(pred, Y_b, mask=Tm_b)
+                        loss.backward()
+                        optimizer.step()
+                        epoch_train_loss += loss.item()
+                        total_train_batches += 1
+
+                    model.eval()
+                    with torch.no_grad():
+                        V_full = v_hw.unsqueeze(0).expand(N, -1, -1)
+                        pred_all = model(X)
+                        epoch_val_loss += kl_divergence_loss(pred_all, Y, mask=V_full).item()
+                    model.train()
+
+                avg_train = epoch_train_loss / max(total_train_batches, 1)
+                val_loss = epoch_val_loss / 4
 
             if val_loss < best_val:
                 best_val = val_loss
@@ -1017,6 +1261,8 @@ def main():
                         help="Model architecture to train (default: quick)")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Number of training epochs (overrides ASTAR_TRAIN_EPOCHS env var)")
+    parser.add_argument("--cv", choices=["quadrant", "round"], default="quadrant",
+                        help="Cross-validation strategy: quadrant (4-fold spatial) or round (leave-one-round-out)")
     args = parser.parse_args()
 
     # Override global EPOCHS if --epochs provided
@@ -1053,7 +1299,7 @@ def main():
         print("No data to train on.")
         return
 
-    train(all_data, reset=args.reset, forever=args.forever, arch=arch)
+    train(all_data, reset=args.reset, forever=args.forever, arch=arch, cv=args.cv)
 
 
 if __name__ == "__main__":
