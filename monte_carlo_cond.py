@@ -171,7 +171,9 @@ class DynamicsCNN(nn.Module):
     """
     One-step dynamics model: predicts P(terrain_{t+1} | terrain_t) per cell.
 
-    Simple architecture: 1 hidden layer CNN with 3×3 convolutions.
+    Architecture: local 3×3 conv + dilated 3×3 conv (dilation=3) + output conv.
+    The dilated layer expands the receptive field to capture long-range
+    interactions (raids, trade, expansion) without extra parameters.
     Input:  (B, 8, H, W) — one-hot terrain at time t
     Output: (B, 8, H, W) — logits for terrain at time t+1
     """
@@ -179,6 +181,10 @@ class DynamicsCNN(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(NUM_TERRAIN, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=3, dilation=3),
             nn.BatchNorm2d(hidden_dim),
             nn.ReLU(),
             nn.Dropout2d(dropout),
