@@ -223,29 +223,6 @@ class QuickCNN(nn.Module):
         return probs
 
 
-class QuickCNN3(nn.Module):
-    """QuickCNN with one additional hidden conv layer (receptive field 7x7)."""
-    def __init__(self, dropout=0.2):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=14, out_channels=32, kernel_size=3, padding=1)
-        self.drop1 = nn.Dropout2d(p=dropout)
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
-        self.drop2 = nn.Dropout2d(p=dropout)
-        self.conv3 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
-        self.drop3 = nn.Dropout2d(p=dropout)
-        self.out_conv = nn.Conv2d(in_channels=32, out_channels=6, kernel_size=1)
-
-    def forward(self, x):
-        x = self.drop1(F.relu(self.conv1(x)))
-        x = self.drop2(F.relu(self.conv2(x)))
-        x = self.drop3(F.relu(self.conv3(x)))
-        logits = self.out_conv(x)
-        probs = F.softmax(logits, dim=1)
-        probs = torch.clamp(probs, min=PROB_FLOOR)
-        probs = probs / probs.sum(dim=1, keepdim=True)
-        return probs
-
-
 OBS_CHANNELS = 7  # 6 class frequencies + 1 coverage
 
 
@@ -348,125 +325,14 @@ class MiniUNet(nn.Module):
         return probs
 
 
-XSEED_OBS_CHANNELS = 7  # 6 cross-seed class frequencies + 1 cross-seed coverage
-
-
-def encode_cross_seed_obs_channels(all_observations, current_seed, width, height):
-    """
-    Encode observations from OTHER seeds into 7 channels.
-    Since hidden parameters are shared across seeds, observations from any
-    seed inform predictions for all seeds.
-
-    Returns: (7, height, width) numpy array — same format as encode_obs_channels.
-    """
-    other_obs = [o for o in all_observations if o["seed_index"] != current_seed]
-    return encode_obs_channels(other_obs, width, height)
-
-
-class MiniUNetV2(nn.Module):
-    """
-    MiniUNet with self-attention at the bottleneck and support for cross-seed
-    observation channels.
-
-    Input: 28 channels = 14 terrain + 7 own-seed obs + 7 cross-seed obs
-    Self-attention at 10x10 bottleneck (100 tokens) enables long-range
-    spatial reasoning (e.g. faction expansion patterns).
-    """
-    def __init__(self, dropout=0.1, in_channels=14 + OBS_CHANNELS + XSEED_OBS_CHANNELS,
-                 attn_heads=4):
-        super().__init__()
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
-        )
-        self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
-        )
-        self.pool2 = nn.MaxPool2d(2)
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
-        )
-        # Self-attention at bottleneck (10x10 = 100 tokens for 40x40 maps)
-        self.attn = nn.MultiheadAttention(128, attn_heads, batch_first=True)
-        self.attn_norm = nn.LayerNorm(128)
-        # Decoder
-        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
-        )
-        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
-        )
-        self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
-
-    def forward(self, x):
-        _, _, H, W = x.shape
-        pad_h = (2 - H % 2) % 2
-        pad_w = (2 - W % 2) % 2
-        if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        b = self.bottleneck(self.pool2(e2))
-
-        # Self-attention at bottleneck
-        B, C, bH, bW = b.shape
-        tokens = b.flatten(2).permute(0, 2, 1)   # (B, bH*bW, C)
-        attn_out, _ = self.attn(tokens, tokens, tokens)
-        tokens = self.attn_norm(tokens + attn_out)  # residual + LayerNorm
-        b = tokens.permute(0, 2, 1).reshape(B, C, bH, bW)
-
-        d2 = self.up2(b)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-        d1 = self.up1(d2)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-        logits = self.out_conv(d1)
-
-        if pad_h or pad_w:
-            logits = logits[:, :, :H, :W]
-
-        probs = F.softmax(logits, dim=1)
-        probs = torch.clamp(probs, min=PROB_FLOOR)
-        probs = probs / probs.sum(dim=1, keepdim=True)
-        return probs
-
-
 MODEL_REGISTRY = {
     "quick": QuickCNN,
-    "quick3": QuickCNN3,
-    "unet": MiniUNet,
-    "unet_aug": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1)),
-    "unet_obs": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1),
-                                       in_channels=14 + OBS_CHANNELS),
-    "unet_v2": lambda **kw: MiniUNetV2(
-        dropout=kw.get('dropout', 0.1),
-        in_channels=14 + OBS_CHANNELS + XSEED_OBS_CHANNELS),
-    "unet_sim": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1),
-                                       in_channels=14 + OBS_CHANNELS),
     "unet_cond": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1),
                                         in_channels=14 + OBS_CHANNELS),
 }
 
 CHECKPOINT_DIR_MAP = {
     "quick": os.path.join(SCRIPT_DIR, "checkpoints"),
-    "quick3": os.path.join(SCRIPT_DIR, "checkpoints_quick3"),
-    "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
-    "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
-    "unet_obs": os.path.join(SCRIPT_DIR, "checkpoints_unet_obs"),
-    "unet_v2": os.path.join(SCRIPT_DIR, "checkpoints_unet_v2"),
-    "unet_sim": os.path.join(SCRIPT_DIR, "checkpoints_unet_sim"),
     "unet_cond": os.path.join(SCRIPT_DIR, "checkpoints_unet_cond"),
 }
 
@@ -1140,7 +1006,7 @@ def load_snapshot_ensemble(arch=None, n_snapshots=5):
 
 
 def ensemble_predict(models, features, width, height, obs_features=None,
-                     xseed_features=None, temperature=1.0):
+                     temperature=1.0):
     """
     Average predictions from multiple models (snapshot ensemble).
     Optionally applies temperature scaling before averaging.
@@ -1149,7 +1015,6 @@ def ensemble_predict(models, features, width, height, obs_features=None,
         models: list of (model, epoch) tuples
         features: (14, H, W) terrain features
         obs_features: optional (7, H, W) own-seed observations
-        xseed_features: optional (7, H, W) cross-seed observations
         temperature: softmax temperature (>1 = softer, <1 = sharper)
 
     Returns: (H, W, 6) ensemble-averaged probability predictions
@@ -1163,8 +1028,6 @@ def ensemble_predict(models, features, width, height, obs_features=None,
             parts = [features]
             if obs_features is not None:
                 parts.append(obs_features)
-            if xseed_features is not None:
-                parts.append(xseed_features)
             x = np.concatenate(parts, axis=0)
             x_t = torch.tensor(x).unsqueeze(0).to(DEVICE)
             # Get raw logits by running through model but extracting before softmax
@@ -1189,7 +1052,7 @@ def ensemble_predict(models, features, width, height, obs_features=None,
 
 
 def learn_temperature(models, features_list, targets_list, width, height,
-                      obs_features_list=None, xseed_features_list=None):
+                      obs_features_list=None):
     """
     Learn optimal temperature T that minimizes KL divergence on validation data.
     Uses simple grid search over [0.5, 2.0].
@@ -1199,7 +1062,6 @@ def learn_temperature(models, features_list, targets_list, width, height,
         features_list: list of (C, H, W) feature arrays
         targets_list: list of (H, W, 6) ground truth probability arrays
         obs_features_list: optional list of (7, H, W) observation arrays
-        xseed_features_list: optional list of (7, H, W) cross-seed obs arrays
 
     Returns: optimal temperature (float)
     """
@@ -1213,9 +1075,8 @@ def learn_temperature(models, features_list, targets_list, width, height,
         total_kl = 0.0
         for i, (feat, target) in enumerate(zip(features_list, targets_list)):
             obs_f = obs_features_list[i] if obs_features_list else None
-            xs_f = xseed_features_list[i] if xseed_features_list else None
             pred = ensemble_predict(models, feat, width, height,
-                                    obs_features=obs_f, xseed_features=xs_f,
+                                    obs_features=obs_f,
                                     temperature=t)
             # KL divergence
             p = np.clip(target, 1e-8, None)
@@ -1356,11 +1217,10 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
                            ensemble_models=None, temperature=1.0):
     """Submit CNN-based predictions for all seeds (overwrites fallback).
 
-    For unet_obs/unet_v2 architectures, observations are encoded as input channels.
+    For unet_cond architecture, observations are encoded as input channels.
     If ensemble_models is provided, uses snapshot ensemble averaging.
     """
-    is_obs_model = arch in ("unet_obs", "unet_v2", "unet_sim", "unet_cond")
-    is_v2 = (arch == "unet_v2")
+    is_obs_model = (arch == "unet_cond")
     use_ensemble = ensemble_models and len(ensemble_models) > 1
 
     if use_ensemble:
@@ -1388,31 +1248,20 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
             )
         features = encoded_grids[seed_idx]
 
-        # Build observation channels
+        # Build observation channels for unet_cond
         obs_feat = None
-        xseed_feat = None
         if is_obs_model:
             seed_obs = obs_by_seed.get(seed_idx, [])
             obs_feat = encode_obs_channels(seed_obs, width, height)
-        if is_v2 and observations:
-            xseed_feat = encode_cross_seed_obs_channels(
-                observations, seed_idx, width, height)
 
         if use_ensemble:
             prediction = ensemble_predict(
                 ensemble_models, features, width, height,
-                obs_features=obs_feat, xseed_features=xseed_feat,
+                obs_features=obs_feat,
                 temperature=temperature)
         else:
-            # Build combined features for single-model prediction
-            all_feat = obs_feat
-            if is_v2 and xseed_feat is not None:
-                if all_feat is not None:
-                    all_feat = np.concatenate([obs_feat, xseed_feat], axis=0)
-                else:
-                    all_feat = xseed_feat
             prediction = predict_full_map(model, features, width, height,
-                                          obs_features=all_feat)
+                                          obs_features=obs_feat)
 
         try:
             result = submit_prediction(round_id, seed_idx, prediction)
@@ -1483,7 +1332,7 @@ def main():
 
         if model is not None:
             # Pretrained model found — use it directly for predictions
-            # Pass observations so unet_obs can use them as input channels
+            # Pass observations so unet_cond can use them as input channels
             print(f"\n--- Submitting pretrained CNN predictions (arch={MODEL_ARCH}) ---")
             encoded_grids = {}
             for seed_idx in range(seeds_count):

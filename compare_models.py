@@ -1,7 +1,7 @@
 """
 Astar Island — Model Comparison Script
 
-Trains all registered architectures (quick, quick3, unet) from scratch on the
+Trains all registered architectures (quick, unet_cond) from scratch on the
 same data using 4-fold quadrant cross-validation, then evaluates each on the
 held-out quadrant and prints a side-by-side comparison table.
 
@@ -32,7 +32,7 @@ from train_cnn import (
     quadrant_masks, load_local_data, fetch_ground_truth, fetch_latest_round,
     load_checkpoint, load_model_from_checkpoint,
     make_model, get_checkpoint_dir, latest_checkpoint,
-    build_fullmap_datasets, augment_maps, kl_divergence_loss,
+    build_fullmap_datasets, kl_divergence_loss,
     save_checkpoint, _clear_checkpoints,
     MODEL_REGISTRY,
     DEVICE, NUM_CLASSES, PROB_FLOOR, VAL_QUADRANT,
@@ -161,11 +161,6 @@ def train_single_model(arch, all_data, epochs, lr, batch_size, reset=False):
     if not features_list:
         print("  ERROR: No usable data.")
         return None
-
-    # Apply rotation/flip augmentation for unet_aug
-    if arch == "unet_aug":
-        features_list, targets_list, meta = augment_maps(
-            features_list, targets_list, meta)
 
     X = torch.tensor(np.stack(features_list)).to(DEVICE)
     Y = torch.tensor(np.stack(targets_list)).to(DEVICE)
@@ -339,7 +334,7 @@ def evaluate_model(ckpt_path, all_data, val_quadrant, use_viewports=False):
         features = encode_initial_grid(initial_grid, width, height)
 
         # For obs-conditioned models: append observation channels (7 extra → 21 total)
-        if arch in ("unet_obs", "unet_sim", "unet_cond"):
+        if arch == "unet_cond":
             all_obs = _load_obs_for_round(round_id_short)
             seed_obs = [o for o in all_obs if o.get("seed_index") == seed_idx]
             obs_feat = encode_obs_channels(seed_obs, width, height)

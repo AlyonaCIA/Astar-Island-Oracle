@@ -288,7 +288,7 @@ def retrain():
     log.info(f"Training data: {len(all_data)} samples (all rounds/seeds)")
     log.info(f"Resuming training up to {MAX_TRAIN_EPOCHS} new epochs")
 
-    # 2. Resume training with all data (augmentation applied inside train())
+    # 2. Resume training with all data
     original_epochs = train_cnn.EPOCHS
     train_cnn.EPOCHS = MAX_TRAIN_EPOCHS
 

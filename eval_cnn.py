@@ -34,7 +34,7 @@ from train_cnn import (
     SCRIPT_DIR as TRAIN_SCRIPT_DIR,
     encode_obs_channels,
 )
-from astar_cnn import bayesian_blend, terrain_to_class
+from astar_cnn import bayesian_blend
 
 _load_dotenv()
 
@@ -261,7 +261,7 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
 
         # --- CNN prediction ---
         with torch.no_grad():
-            if arch in ("unet_obs", "unet_sim", "unet_cond"):
+            if arch == "unet_cond":
                 obs_feat = encode_obs_channels(seed_obs or [], width, height)
                 x = np.concatenate([features, obs_feat], axis=0)  # (21, H, W)
             else:

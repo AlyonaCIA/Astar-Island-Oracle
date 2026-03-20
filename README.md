@@ -21,7 +21,7 @@ Our toolkit for the **Astar Island** ML challenge — a Norse civilisation simul
 - [Data Analysis](#data-analysis)
 - [Key Findings](#key-findings)
 - [Project Structure](#project-structure)
-- [All Model Architectures](#all-model-architectures)
+- [Model Architectures](#model-architectures)
 
 ---
 
@@ -39,11 +39,8 @@ A 40×40 procedurally generated map runs a Norse simulation for 50 years: settle
 | `astar_cnn.py` | Live inference: viewport strategy, observation encoding, model loading, prediction submission |
 | `train_cnn.py` | Offline training with ground truth + simulation replay data |
 | `eval_cnn.py` | Evaluate checkpoints against competition metric |
-| `compare_models.py` | Train & compare all architectures side-by-side |
-| `data_check.py` | Data analysis: verify stochastic behavior, compare replays vs observations |
-| `analyze.py` | Plot training curves from `training_history.json` |
-| `astar_uniform.py` | Baseline: uniform 1/6 probability everywhere (0 queries) |
-| `astar_baseline.py` | Baseline: hand-tuned terrain priors + observation blending |
+| `compare_models.py` | Train & compare architectures side-by-side |
+| `observations_viz.py` | Visualize viewport coverage |
 
 ---
 
@@ -177,9 +174,9 @@ python train_cnn.py --model unet_cond --cv all
 
 **Why not quadrant CV for obs-conditioned models?** The model takes observation channels as input covering the full 40×40 map. In quadrant CV, the held-out quadrant's pixels are masked from the *target* but their observation channels remain visible in the *input* — leaking the answer. Round-based CV holds out entire maps, so the model never sees any data from the validation round.
 
-**Quadrant CV is still available** for architectures without observation channels:
+**Quadrant CV is still available** for terrain-only architectures:
 ```bash
-python train_cnn.py --model unet --cv quadrant
+python train_cnn.py --model quick --cv quadrant
 ```
 
 ### Observation Dropout
@@ -245,16 +242,15 @@ python train_cnn.py --model unet_cond --forever           # train until Ctrl+C
 python train_cnn.py --model unet_cond --fetch             # fetch GT from API first
 python train_cnn.py --model unet_cond --epochs 2000       # override epoch count
 
-# Other architectures
-python train_cnn.py --model unet_sim --cv round           # leave-one-round-out
-python train_cnn.py --model unet --cv quadrant            # older arch with quadrant CV
+# Simple CNN baseline
+python train_cnn.py --model quick --cv quadrant           # terrain-only, quadrant CV
 ```
 
 ### Evaluate
 
 ```bash
 python eval_cnn.py --arch unet_cond                       # latest checkpoint
-python eval_cnn.py --arch unet_sim                        # compare against previous
+python eval_cnn.py --arch quick                           # simple CNN baseline
 python eval_cnn.py --arch unet_cond --viewports           # viewport-restricted eval
 ```
 
@@ -262,7 +258,7 @@ python eval_cnn.py --arch unet_cond --viewports           # viewport-restricted 
 
 ```bash
 python compare_models.py --eval-only                      # eval all existing checkpoints
-python compare_models.py --eval-only --models unet_cond unet_sim
+python compare_models.py --eval-only --models unet_cond quick
 ```
 
 ---
@@ -270,8 +266,6 @@ python compare_models.py --eval-only --models unet_cond unet_sim
 ## Data Analysis
 
 ```bash
-python data_check.py         # verify stochastic behavior + replay vs observation comparison
-python analyze.py            # plot training curves
 python observations_viz.py   # visualize viewport coverage
 ```
 
@@ -279,7 +273,7 @@ python observations_viz.py   # visualize viewport coverage
 
 ## Key Findings
 
-From `data_check.py` analysis across 7 rounds of observation data:
+From analysis across 7 rounds of observation data:
 
 1. **Simulations are stochastic:** 294/306 overlapping viewport pairs show cell-level differences. 28.8% of overlapping cells have different values across queries.
 
@@ -298,11 +292,7 @@ Astar-Island-Oracle/
 ├── train_cnn.py             # Offline training (ground truth + replays)
 ├── eval_cnn.py              # Checkpoint evaluation
 ├── compare_models.py        # Architecture comparison
-├── data_check.py            # Data analysis (stochastic verification)
-├── analyze.py               # Training curve plots
 ├── observations_viz.py      # Viewport coverage visualization
-├── astar_uniform.py         # Baseline: uniform 1/6
-├── astar_baseline.py        # Baseline: terrain priors + blending
 ├── CHALLENGE.md             # Full challenge specification
 ├── data/
 │   ├── ground_truth/        # GT files: r{N}_s{M}_{id}.json (40×40×6 probabilities)
@@ -310,24 +300,14 @@ Astar-Island-Oracle/
 │   └── round_*.json         # Cached round metadata
 ├── simulation_replays/      # Replay files: r{N}s{M}.json (51 frames each)
 ├── checkpoints_unet_cond/   # unet_cond checkpoints (production)
-├── checkpoints_unet_sim/    # unet_sim checkpoints
-├── checkpoints_unet/        # MiniUNet checkpoints
-├── checkpoints_unet_aug/    # Augmented MiniUNet checkpoints
-├── checkpoints/             # QuickCNN checkpoints
-└── checkpoints_quick3/      # QuickCNN3 checkpoints
+└── checkpoints/             # QuickCNN checkpoints
 ```
 
 ---
 
-## All Model Architectures
+## Model Architectures
 
 | Architecture | Input Channels | Params | Description | CV Default | Loss |
 |---|---|---|---|---|---|
 | `unet_cond` | 21 (14 terrain + 7 obs) | ~472K | **Production.** Multi-replay obs, entropy-weighted KL, no augmentation | `all` | entropy-weighted KL |
-| `unet_sim` | 21 (14 terrain + 7 obs) | ~472K | Single-replay obs, rotation augmentation | `round` | KL divergence |
-| `unet_obs` | 21 (14 terrain + 7 obs) | ~472K | MiniUNet with real observation channels | `round` | KL divergence |
-| `unet_v2` | 28 (14 + 7 obs + 7 cross-seed) | ~490K | MiniUNetV2 with cross-seed channels | `round` | KL divergence |
-| `unet_aug` | 14 | ~470K | MiniUNet with augmentation + dropout | `quadrant` | KL divergence |
-| `unet` | 14 | ~470K | MiniUNet (terrain only) | `quadrant` | KL divergence |
-| `quick` | 14 | ~35K | QuickCNN (3-layer, no spatial context) | `quadrant` | KL divergence |
-| `quick3` | 14 | ~35K | QuickCNN3 (3-layer variant) | `quadrant` | KL divergence |
+| `quick` | 14 | ~35K | QuickCNN (2-layer, terrain-only baseline) | `quadrant` | KL divergence |
