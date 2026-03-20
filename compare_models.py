@@ -29,7 +29,7 @@ sys.path.insert(0, SCRIPT_DIR)
 from train_cnn import (
     _load_dotenv,
     encode_initial_grid,
-    quadrant_masks, load_local_data, fetch_ground_truth,
+    quadrant_masks, load_local_data, fetch_ground_truth, fetch_latest_round,
     load_checkpoint, load_model_from_checkpoint,
     make_model, get_checkpoint_dir, latest_checkpoint,
     build_fullmap_datasets, augment_maps, kl_divergence_loss,
@@ -345,6 +345,8 @@ def main():
                         help="Clear existing checkpoints and train from scratch")
     parser.add_argument("--fetch", action="store_true",
                         help="Fetch/update ground truth from API first")
+    parser.add_argument("--fetch-latest", action="store_true",
+                        help="Fetch only the latest round, then load all cached data")
     parser.add_argument("--models", nargs="+", default=list(MODEL_REGISTRY.keys()),
                         choices=list(MODEL_REGISTRY.keys()),
                         help="Which models to compare (default: all)")
@@ -366,6 +368,9 @@ def main():
     if args.fetch:
         print(f"\n--- Fetching ground truth from API ---")
         all_data = fetch_ground_truth()
+    elif args.fetch_latest:
+        print(f"\n--- Fetching latest round from API ---")
+        all_data = fetch_latest_round()
     else:
         print(f"\n--- Loading local ground truth ---")
         all_data = load_local_data()

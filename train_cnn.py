@@ -17,6 +17,7 @@ import json
 import math
 import argparse
 import datetime
+import functools
 import numpy as np
 import requests
 import torch
@@ -188,6 +189,47 @@ def fetch_ground_truth():
     return all_data
 
 
+def fetch_latest_round():
+    """
+    Download ground truth for only the most recent completed/scoring round,
+    then load ALL local data (including previously cached rounds).
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    time.sleep(1.0)
+    rounds = get_rounds()
+    eligible = [r for r in rounds if r["status"] in ("completed", "scoring")]
+
+    if not eligible:
+        print("No completed/scoring rounds found.")
+        return load_local_data()
+
+    # Pick the latest by round_number
+    latest = max(eligible, key=lambda r: r["round_number"])
+    round_id = latest["id"]
+    round_num = latest["round_number"]
+    seeds_count = latest.get("seeds_count", 5)
+    print(f"Fetching latest: Round #{round_num} ({round_id[:8]}…) — {seeds_count} seeds")
+
+    for seed_idx in range(seeds_count):
+        cache_file = os.path.join(DATA_DIR, f"r{round_num}_s{seed_idx}_{round_id[:8]}.json")
+        if os.path.exists(cache_file):
+            print(f"  Seed {seed_idx}: cached ✓")
+        else:
+            print(f"  Seed {seed_idx}: downloading…", end=" ", flush=True)
+            try:
+                data = get_analysis(round_id, seed_idx)
+                with open(cache_file, "w") as f:
+                    json.dump(data, f)
+                print(f"score={data.get('score', '?')}")
+                time.sleep(1.0)
+            except requests.HTTPError as e:
+                print(f"FAILED ({e})")
+
+    # Now load everything from disk (all rounds)
+    return load_local_data()
+
+
 # ---------------------------------------------------------------------------
 # Feature encoding (same as astar_cnn.py)
 # ---------------------------------------------------------------------------
@@ -345,7 +387,7 @@ MODEL_REGISTRY = {
     "quick": QuickCNN,
     "quick3": QuickCNN3,
     "unet": MiniUNet,
-    "unet_aug": MiniUNet,  # same architecture, trained with augmented data
+    "unet_aug": functools.partial(MiniUNet, dropout=0.1),  # lower dropout for augmented training
 }
 
 # Separate checkpoint dirs per architecture
@@ -839,6 +881,8 @@ def main():
                         help="Train indefinitely until Ctrl+C (ignores ASTAR_TRAIN_EPOCHS)")
     parser.add_argument("--fetch", action="store_true",
                         help="Fetch/update ground truth from API (default: use local cache only)")
+    parser.add_argument("--fetch-latest", action="store_true",
+                        help="Fetch only the latest round, then load all cached data")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), default="quick",
                         help="Model architecture to train (default: quick)")
     args = parser.parse_args()
@@ -861,6 +905,9 @@ def main():
     if args.fetch:
         print(f"\n--- Fetching ground truth from API ---")
         all_data = fetch_ground_truth()
+    elif args.fetch_latest:
+        print(f"\n--- Fetching latest round from API ---")
+        all_data = fetch_latest_round()
     else:
         print(f"\n--- Loading local ground truth ---")
         all_data = load_local_data()
