@@ -319,11 +319,11 @@ class QuickCNN3(nn.Module):
 
 class MiniUNet(nn.Module):
     """Small U-Net for 40x40 maps. Encoder-decoder with skip connections."""
-    def __init__(self, dropout=0.2):
+    def __init__(self, dropout=0.2, in_channels=14):
         super().__init__()
         # Encoder
         self.enc1 = nn.Sequential(
-            nn.Conv2d(14, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(),
             nn.Dropout2d(dropout),
             nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
         )
@@ -382,12 +382,15 @@ class MiniUNet(nn.Module):
         return probs
 
 
+OBS_CHANNELS = 7  # 6 class frequencies + 1 coverage
+
 # Registry for model selection
 MODEL_REGISTRY = {
     "quick": QuickCNN,
     "quick3": QuickCNN3,
     "unet": MiniUNet,
-    "unet_aug": functools.partial(MiniUNet, dropout=0.1),  # lower dropout for augmented training
+    "unet_aug": functools.partial(MiniUNet, dropout=0.1),
+    "unet_obs": functools.partial(MiniUNet, dropout=0.1, in_channels=14 + OBS_CHANNELS),
 }
 
 # Separate checkpoint dirs per architecture
@@ -396,6 +399,7 @@ CHECKPOINT_DIR_MAP = {
     "quick3": os.path.join(SCRIPT_DIR, "checkpoints_quick3"),
     "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
     "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
+    "unet_obs": os.path.join(SCRIPT_DIR, "checkpoints_unet_obs"),
 }
 
 
@@ -567,6 +571,125 @@ def augment_maps(features_list, targets_list, meta):
 
 
 # ---------------------------------------------------------------------------
+# Observation loading & encoding for unet_obs
+# ---------------------------------------------------------------------------
+
+OBS_DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+_TERRAIN_TO_CLASS = {10: 0, 11: 0, 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
+
+
+def _load_obs_for_round(round_id_short):
+    """Load observation list for a round. Returns list or empty list."""
+    path = os.path.join(OBS_DATA_DIR, f"observations_{round_id_short}.json")
+    if not os.path.isfile(path):
+        return []
+    with open(path) as f:
+        raw = json.load(f)
+    if isinstance(raw, dict):
+        return raw.get("observations", [])
+    return raw
+
+
+def encode_obs_channels(observations, width, height):
+    """
+    Encode viewport observations into 7 extra input channels.
+
+    Channels 0-5: observed class frequency at each pixel
+    Channel 6:    log(1 + total_observations) coverage indicator
+
+    Returns: (7, height, width) numpy array
+    """
+    obs_counts = np.zeros((NUM_CLASSES, height, width), dtype=np.float32)
+    obs_hits = np.zeros((height, width), dtype=np.float32)
+
+    for obs in observations:
+        vp = obs["viewport"]
+        vx, vy = vp["x"], vp["y"]
+        grid = obs["grid"]
+        for dy in range(len(grid)):
+            for dx in range(len(grid[0])):
+                gy, gx = vy + dy, vx + dx
+                if 0 <= gy < height and 0 <= gx < width:
+                    cls = _TERRAIN_TO_CLASS.get(grid[dy][dx], 0)
+                    obs_counts[cls, gy, gx] += 1.0
+                    obs_hits[gy, gx] += 1.0
+
+    mask = obs_hits > 0
+    for c in range(NUM_CLASSES):
+        obs_counts[c][mask] /= obs_hits[mask]
+
+    coverage = np.log1p(obs_hits)[np.newaxis, :, :]
+    return np.concatenate([obs_counts, coverage], axis=0)
+
+
+def build_fullmap_datasets_obs(all_data, val_quadrant=3):
+    """
+    Build full-map datasets with observation channels for unet_obs training.
+
+    For seeds with observations: terrain(14) + obs(7) = 21 channels
+    For seeds without observations: obs channels are zeros (fallback mode)
+
+    Returns same structure as build_fullmap_datasets but features are (21, H, W).
+    """
+    features_list, targets_list = [], []
+    train_masks, val_masks = [], []
+    meta = []
+
+    # Group observations by round_id_short
+    obs_cache = {}
+
+    for data in all_data:
+        initial_grid = data.get("initial_grid")
+        ground_truth = data.get("ground_truth")
+        if initial_grid is None or ground_truth is None:
+            continue
+
+        width = data["width"]
+        height = data["height"]
+        seed_idx = data.get("_seed_index", 0)
+        round_id = data.get("_round_id", "")
+        round_id_short = round_id[:8] if round_id else ""
+
+        # Terrain features (14, H, W)
+        terrain_feat = encode_initial_grid(initial_grid, width, height)
+
+        # Load observations for this round (cached)
+        if round_id_short not in obs_cache:
+            obs_cache[round_id_short] = _load_obs_for_round(round_id_short)
+        all_obs = obs_cache[round_id_short]
+
+        # Filter observations for this seed
+        seed_obs = [o for o in all_obs if o.get("seed_index") == seed_idx]
+
+        # Observation channels (7, H, W) — zeros if no observations
+        obs_feat = encode_obs_channels(seed_obs, width, height)
+
+        # Concatenate: (21, H, W)
+        features = np.concatenate([terrain_feat, obs_feat], axis=0)
+
+        gt = np.array(ground_truth, dtype=np.float32).transpose(2, 0, 1)
+        tmask, vmask = quadrant_masks(height, width, val_quadrant)
+
+        features_list.append(features)
+        targets_list.append(gt)
+        train_masks.append(tmask)
+        val_masks.append(vmask)
+        meta.append({
+            "round": data.get("_round_number"),
+            "seed": seed_idx,
+            "score": data.get("score"),
+            "has_obs": len(seed_obs) > 0,
+            "n_obs": len(seed_obs),
+        })
+
+    n_with_obs = sum(1 for m in meta if m["has_obs"])
+    print(f"  Full maps: {len(features_list)} "
+          f"({n_with_obs} with observations, "
+          f"{len(features_list) - n_with_obs} without)")
+    return features_list, targets_list, train_masks, val_masks, meta
+
+
+# ---------------------------------------------------------------------------
 # Loss: KL divergence (same metric used for scoring)
 # ---------------------------------------------------------------------------
 
@@ -679,15 +802,20 @@ def train(all_data, reset=False, forever=False, arch="quick"):
     print(f"  Architecture: {arch}")
     print(f"{'='*60}")
 
-    features_list, targets_list, _, _, meta = \
-        build_fullmap_datasets(all_data, val_quadrant=0)
+    # Build datasets — unet_obs uses observation-conditioned features (21 ch)
+    if arch == "unet_obs":
+        features_list, targets_list, _, _, meta = \
+            build_fullmap_datasets_obs(all_data, val_quadrant=0)
+    else:
+        features_list, targets_list, _, _, meta = \
+            build_fullmap_datasets(all_data, val_quadrant=0)
 
     if not features_list:
         print("ERROR: No usable data found.")
         return
 
-    # Apply rotation/flip augmentation for unet_aug
-    if arch == "unet_aug":
+    # Apply rotation/flip augmentation for augmented architectures
+    if arch in ("unet_aug", "unet_obs"):
         features_list, targets_list, meta = augment_maps(
             features_list, targets_list, meta)
 
@@ -887,7 +1015,14 @@ def main():
                         help="Fetch only the latest round, then load all cached data")
     parser.add_argument("--model", choices=list(MODEL_REGISTRY.keys()), default="quick",
                         help="Model architecture to train (default: quick)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Number of training epochs (overrides ASTAR_TRAIN_EPOCHS env var)")
     args = parser.parse_args()
+
+    # Override global EPOCHS if --epochs provided
+    global EPOCHS
+    if args.epochs is not None:
+        EPOCHS = args.epochs
 
     arch = args.model
     ckpt_dir = get_checkpoint_dir(arch)

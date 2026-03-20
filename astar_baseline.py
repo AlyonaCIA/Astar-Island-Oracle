@@ -192,22 +192,28 @@ def submit_prediction(round_id, seed_index, prediction):
 
 def compute_tile_grid(width, height, max_tile=15):
     """
-    Non-overlapping tile partition covering the entire map.
-    For a 40x40 map: 9 tiles (3x3) at x=[0,15,30], y=[0,15,30].
+    Full-size viewport grid covering the entire map.
+    Every tile is max_tile × max_tile (no wasted viewport area).
+    Edge tiles are shifted inward so no pixel falls outside the map,
+    creating natural overlap instead of smaller edge tiles.
+
+    For a 40×40 map with max_tile=15: 9 tiles (3×3), all 15×15.
+      x=[0, 12, 25]  y=[0, 12, 25]  — overlap at edges instead of shrinkage.
     Returns list of (x, y, w, h) tuples.
     """
-    x_specs = []
-    x = 0
-    while x < width:
-        w = min(max_tile, width - x)
-        x_specs.append((x, w))
-        x += w
-    y_specs = []
-    y = 0
-    while y < height:
-        h = min(max_tile, height - y)
-        y_specs.append((y, h))
-        y += h
+    def axis_positions(length, tile_size):
+        if length <= tile_size:
+            return [(0, min(length, tile_size))]
+        n_tiles = -(-length // tile_size)  # ceil division
+        max_start = length - tile_size
+        positions = []
+        for i in range(n_tiles):
+            start = round(i * max_start / (n_tiles - 1)) if n_tiles > 1 else 0
+            positions.append((start, tile_size))
+        return positions
+
+    x_specs = axis_positions(width, max_tile)
+    y_specs = axis_positions(height, max_tile)
     return [(tx, ty, tw, th) for (ty, th) in y_specs for (tx, tw) in x_specs]
 
 

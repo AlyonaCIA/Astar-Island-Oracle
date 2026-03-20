@@ -36,9 +36,59 @@ from train_cnn import (
     save_checkpoint, _clear_checkpoints,
     MODEL_REGISTRY,
     DEVICE, NUM_CLASSES, PROB_FLOOR, VAL_QUADRANT,
+    encode_obs_channels, _load_obs_for_round,
 )
 
 _load_dotenv()
+
+DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+
+
+# ---------------------------------------------------------------------------
+# Viewport helpers
+# ---------------------------------------------------------------------------
+
+def _load_viewport_masks(round_id_short, height, width):
+    """Load observations for a round and build per-seed boolean masks."""
+    obs_path = os.path.join(DATA_DIR, f"observations_{round_id_short}.json")
+    if not os.path.isfile(obs_path):
+        return None
+    with open(obs_path) as f:
+        raw = json.load(f)
+    observations = raw.get("observations", []) if isinstance(raw, dict) else raw
+    masks = {}
+    for obs in observations:
+        sid = obs["seed_index"]
+        vp = obs["viewport"]
+        vx, vy, vw, vh = vp["x"], vp["y"], vp["w"], vp["h"]
+        if sid not in masks:
+            masks[sid] = np.zeros((height, width), dtype=bool)
+        y_end = min(vy + vh, height)
+        x_end = min(vx + vw, width)
+        masks[sid][vy:y_end, vx:x_end] = True
+    return masks
+
+
+def _masked_weighted_kl(pred_pixels, target_pixels):
+    """Entropy-weighted KL for flat arrays of masked pixels. (P, 6) each."""
+    pred_pixels = np.clip(pred_pixels, 1e-8, None)
+    target_pixels = np.clip(target_pixels, 1e-8, None)
+    kl = (target_pixels * (np.log(target_pixels) - np.log(pred_pixels))).sum(axis=-1)
+    ent = -(target_pixels * np.log(target_pixels)).sum(axis=-1)
+    total_entropy = ent.sum()
+    if total_entropy < 1e-12:
+        return 0.0
+    return (kl * ent).sum() / total_entropy
+
+
+def _viewport_score(pred, gt, vp_mask):
+    """Competition score restricted to viewport-observed pixels."""
+    pred_px = pred[vp_mask]   # (P, 6)
+    gt_px = gt[vp_mask]       # (P, 6)
+    if len(pred_px) == 0:
+        return 0.0, 999.0
+    wkl = _masked_weighted_kl(pred_px, gt_px)
+    return 100.0 * np.exp(-3.0 * wkl), wkl
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +313,15 @@ def train_single_model(arch, all_data, epochs, lr, batch_size, reset=False):
 # Evaluation of a single model
 # ---------------------------------------------------------------------------
 
-def evaluate_model(ckpt_path, all_data, val_quadrant):
+def evaluate_model(ckpt_path, all_data, val_quadrant, use_viewports=False):
     """Evaluate a checkpoint. Returns dict of metrics."""
     model, ckpt = load_model_from_checkpoint(ckpt_path)
     arch = ckpt.get("model_arch") or ckpt.get("metadata", {}).get("model_arch", "quick")
     epoch = ckpt.get("epoch", "?")
     model.eval()
+
+    # Pre-load viewport masks per round
+    vp_masks_cache = {}
 
     results = []
     for data in all_data:
@@ -279,8 +332,19 @@ def evaluate_model(ckpt_path, all_data, val_quadrant):
 
         width = data["width"]
         height = data["height"]
+        seed_idx = data.get("_seed_index", 0)
+        round_id = data.get("_round_id", "")
+        round_id_short = round_id[:8] if round_id else ""
         gt = np.array(ground_truth, dtype=np.float32)
         features = encode_initial_grid(initial_grid, width, height)
+
+        # For unet_obs: append observation channels (7 extra → 21 total)
+        if arch == "unet_obs":
+            all_obs = _load_obs_for_round(round_id_short)
+            seed_obs = [o for o in all_obs if o.get("seed_index") == seed_idx]
+            obs_feat = encode_obs_channels(seed_obs, width, height)
+            features = np.concatenate([features, obs_feat], axis=0)
+
         _, val_mask = quadrant_masks(height, width, val_quadrant)
 
         with torch.no_grad():
@@ -295,26 +359,39 @@ def evaluate_model(ckpt_path, all_data, val_quadrant):
         # Val-only score (unseen quadrant)
         gt_val = gt.copy()
         pred_val = cnn_pred.copy()
-        # Zero out train region for val-only metric
         train_mask = ~val_mask
         gt_val[train_mask] = 1.0 / NUM_CLASSES
         pred_val[train_mask] = 1.0 / NUM_CLASSES
         score_val, wkl_val = competition_score(pred_val, gt_val)
 
-        results.append({
+        result = {
             "round": data.get("_round_number", "?"),
-            "seed": data.get("_seed_index", "?"),
+            "seed": seed_idx,
             "score_full": score_full,
             "wkl_full": wkl_full,
             "score_val": score_val,
             "wkl_val": wkl_val,
-        })
+        }
+
+        # Viewport-only metrics
+        if use_viewports and round_id_short:
+            if round_id_short not in vp_masks_cache:
+                vp_masks_cache[round_id_short] = _load_viewport_masks(
+                    round_id_short, height, width)
+            vp_masks = vp_masks_cache[round_id_short]
+            if vp_masks and seed_idx in vp_masks:
+                vp_mask = vp_masks[seed_idx]
+                vp_score, vp_wkl = _viewport_score(cnn_pred, gt, vp_mask)
+                result["vp_score"] = vp_score
+                result["vp_wkl"] = vp_wkl
+
+        results.append(result)
 
     if not results:
         return {"arch": arch, "epoch": epoch, "avg_score_full": 0, "avg_wkl_full": 999,
                 "avg_score_val": 0, "avg_wkl_val": 999, "n_samples": 0, "per_seed": []}
 
-    return {
+    out = {
         "arch": arch,
         "epoch": epoch,
         "avg_score_full": np.mean([r["score_full"] for r in results]),
@@ -324,6 +401,12 @@ def evaluate_model(ckpt_path, all_data, val_quadrant):
         "n_samples": len(results),
         "per_seed": results,
     }
+    vp_results = [r for r in results if "vp_score" in r]
+    if vp_results:
+        out["avg_vp_score"] = np.mean([r["vp_score"] for r in vp_results])
+        out["avg_vp_wkl"] = np.mean([r["vp_wkl"] for r in vp_results])
+        out["n_vp_samples"] = len(vp_results)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +436,8 @@ def main():
     parser.add_argument("--val-quadrant", type=int, default=VAL_QUADRANT,
                         choices=[0, 1, 2, 3],
                         help="Validation quadrant (default: 3)")
+    parser.add_argument("--viewports", action="store_true",
+                        help="Also evaluate on viewport-observed pixels only")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -361,6 +446,8 @@ def main():
     print(f"  Device: {DEVICE}")
     print(f"  Models: {args.models}")
     print(f"  Val quadrant: {args.val_quadrant}")
+    if args.viewports:
+        print(f"  Viewports: enabled (viewport-only metrics included)")
     if not args.eval_only:
         print(f"  Epochs: {args.epochs}, LR: {args.lr}, Batch: {args.batch_size}")
 
@@ -399,12 +486,16 @@ def main():
     # Baselines first
     print(f"\n--- Baselines ---")
     baseline_results = []
+    vp_masks_cache = {}
     for data in all_data:
         initial_grid = data.get("initial_grid")
         ground_truth = data.get("ground_truth")
         if initial_grid is None or ground_truth is None:
             continue
         width, height = data["width"], data["height"]
+        seed_idx = data.get("_seed_index", 0)
+        round_id = data.get("_round_id", "")
+        round_id_short = round_id[:8] if round_id else ""
         gt = np.array(ground_truth, dtype=np.float32)
 
         uniform_pred = np.full((height, width, NUM_CLASSES), 1.0 / NUM_CLASSES)
@@ -413,12 +504,26 @@ def main():
         uni_score, uni_wkl = competition_score(uniform_pred, gt)
         pri_score, pri_wkl = competition_score(prior_pred, gt)
 
-        baseline_results.append({
+        br = {
             "round": data.get("_round_number", "?"),
-            "seed": data.get("_seed_index", "?"),
+            "seed": seed_idx,
             "uni_score": uni_score, "uni_wkl": uni_wkl,
             "pri_score": pri_score, "pri_wkl": pri_wkl,
-        })
+        }
+
+        if args.viewports and round_id_short:
+            if round_id_short not in vp_masks_cache:
+                vp_masks_cache[round_id_short] = _load_viewport_masks(
+                    round_id_short, height, width)
+            vp_masks = vp_masks_cache[round_id_short]
+            if vp_masks and seed_idx in vp_masks:
+                vp_mask = vp_masks[seed_idx]
+                br["vp_uni_score"], br["vp_uni_wkl"] = _viewport_score(
+                    uniform_pred, gt, vp_mask)
+                br["vp_pri_score"], br["vp_pri_wkl"] = _viewport_score(
+                    prior_pred, gt, vp_mask)
+
+        baseline_results.append(br)
 
     all_results["uniform"] = {
         "arch": "uniform", "epoch": "-",
@@ -432,6 +537,17 @@ def main():
         "avg_wkl_full": np.mean([r["pri_wkl"] for r in baseline_results]),
         "n_samples": len(baseline_results),
     }
+    # Viewport metrics for baselines
+    vp_uni = [r for r in baseline_results if "vp_uni_score" in r]
+    if vp_uni:
+        all_results["uniform"]["avg_vp_score"] = np.mean([r["vp_uni_score"] for r in vp_uni])
+        all_results["uniform"]["avg_vp_wkl"] = np.mean([r["vp_uni_wkl"] for r in vp_uni])
+        all_results["uniform"]["n_vp_samples"] = len(vp_uni)
+    vp_pri = [r for r in baseline_results if "vp_pri_score" in r]
+    if vp_pri:
+        all_results["prior"]["avg_vp_score"] = np.mean([r["vp_pri_score"] for r in vp_pri])
+        all_results["prior"]["avg_vp_wkl"] = np.mean([r["vp_pri_wkl"] for r in vp_pri])
+        all_results["prior"]["n_vp_samples"] = len(vp_pri)
 
     # Evaluate each model
     for arch in args.models:
@@ -443,16 +559,24 @@ def main():
             print(f"  {arch}: no checkpoint found, skipping")
             continue
         print(f"\n--- Evaluating: {arch} ({os.path.basename(ckpt_path)}) ---")
-        res = evaluate_model(ckpt_path, all_data, args.val_quadrant)
+        res = evaluate_model(ckpt_path, all_data, args.val_quadrant,
+                             use_viewports=args.viewports)
         all_results[arch] = res
 
     # --- Comparison table ---
+    show_vp = args.viewports and any(
+        "avg_vp_score" in all_results.get(n, {}) for n in ["uniform", "prior"] + args.models)
+
     print(f"\n{'='*70}")
     print(f"  COMPARISON RESULTS  (val quadrant = {args.val_quadrant})")
     print(f"{'='*70}")
-    print(f"  {'Model':<12} | {'Epoch':>6} | {'Score (full)':>13} | "
-          f"{'WKL (full)':>11} | {'Score (val)':>12} | {'WKL (val)':>10} | {'N':>3}")
-    print("  " + "-" * 66)
+    header = (f"  {'Model':<12} | {'Epoch':>6} | {'Score (full)':>13} | "
+              f"{'WKL (full)':>11} | {'Score (val)':>12} | {'WKL (val)':>10} | {'N':>3}")
+    if show_vp:
+        header += f" | {'VP Score':>9} | {'VP WKL':>8}"
+    print(header)
+    sep_len = 66 + (22 if show_vp else 0)
+    print("  " + "-" * sep_len)
 
     for name in ["uniform", "prior"] + args.models:
         r = all_results.get(name)
@@ -464,8 +588,14 @@ def main():
         s_val = f"{r.get('avg_score_val', 0):>9.2f}" if "avg_score_val" in r else "     n/a"
         w_val = f"{r.get('avg_wkl_val', 0):>7.5f}" if "avg_wkl_val" in r else "    n/a"
         n = r.get("n_samples", 0)
-        print(f"  {name:<12} | {epoch_s:>6} | {s_full:>13} | {w_full:>11} | "
-              f"{s_val:>12} | {w_val:>10} | {n:>3}")
+        line = (f"  {name:<12} | {epoch_s:>6} | {s_full:>13} | {w_full:>11} | "
+                f"{s_val:>12} | {w_val:>10} | {n:>3}")
+        if show_vp:
+            if "avg_vp_score" in r:
+                line += f" | {r['avg_vp_score']:>9.2f} | {r['avg_vp_wkl']:>8.5f}"
+            else:
+                line += f" | {'n/a':>9} | {'n/a':>8}"
+        print(line)
 
     # Per-seed detail for CNN models
     for arch in args.models:
@@ -473,12 +603,21 @@ def main():
         if not r or not r.get("per_seed"):
             continue
         print(f"\n  --- {arch} per-seed detail ---")
-        print(f"  {'Round':>5} {'Seed':>4} | {'Score':>8} | {'WKL':>10} | {'Val Score':>10} | {'Val WKL':>10}")
-        print("  " + "-" * 52)
+        hdr = f"  {'Round':>5} {'Seed':>4} | {'Score':>8} | {'WKL':>10} | {'Val Score':>10} | {'Val WKL':>10}"
+        if show_vp:
+            hdr += f" | {'VP Score':>9} | {'VP WKL':>8}"
+        print(hdr)
+        print("  " + "-" * (52 + (22 if show_vp else 0)))
         for s in r["per_seed"]:
-            print(f"  R{s['round']:>4} S{s['seed']:>3} | "
-                  f"{s['score_full']:>8.2f} | {s['wkl_full']:>10.5f} | "
-                  f"{s['score_val']:>10.2f} | {s['wkl_val']:>10.5f}")
+            line = (f"  R{s['round']:>4} S{s['seed']:>3} | "
+                    f"{s['score_full']:>8.2f} | {s['wkl_full']:>10.5f} | "
+                    f"{s['score_val']:>10.2f} | {s['wkl_val']:>10.5f}")
+            if show_vp:
+                if "vp_score" in s:
+                    line += f" | {s['vp_score']:>9.2f} | {s['vp_wkl']:>8.5f}"
+                else:
+                    line += f" | {'n/a':>9} | {'n/a':>8}"
+            print(line)
 
     # Best model
     best_name = None

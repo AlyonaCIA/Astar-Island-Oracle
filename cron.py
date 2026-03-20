@@ -217,8 +217,6 @@ def run_pipeline():
 
     if model is not None:
         log.info(f"Loaded UNet (epoch {epoch}). Submitting predictions...")
-        if observations:
-            log.info(f"  Blending with {len(observations)} observations")
         encoded_grids = {}
         for seed_idx in range(seeds_count):
             encoded_grids[seed_idx] = astar_cnn.encode_initial_grid(
@@ -228,7 +226,6 @@ def run_pipeline():
             astar_cnn.submit_cnn_predictions(
                 round_id, model, encoded_grids, initial_states,
                 seeds_count, width, height,
-                observations=observations if observations else None,
             )
             log.info("UNet predictions submitted successfully.")
         except Exception as e:

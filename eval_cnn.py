@@ -32,6 +32,7 @@ from train_cnn import (
     get_checkpoint_dir, latest_checkpoint, MODEL_REGISTRY,
     CHECKPOINT_DIR, DEVICE, NUM_CLASSES, PROB_FLOOR, VAL_QUADRANT,
     SCRIPT_DIR as TRAIN_SCRIPT_DIR,
+    encode_obs_channels,
 )
 from astar_cnn import bayesian_blend, terrain_to_class
 
@@ -249,9 +250,23 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
 
         _, val_mask = quadrant_masks(height, width, val_quadrant)
 
+        # --- Load observations for this seed ---
+        seed_obs = None
+        if round_id_short in obs_index:
+            all_obs = load_observations_list(round_id_short)
+            if all_obs:
+                seed_obs = [o for o in all_obs if o["seed_index"] == seed]
+                if not seed_obs:
+                    seed_obs = None
+
         # --- CNN prediction ---
         with torch.no_grad():
-            x = torch.tensor(features).unsqueeze(0).to(DEVICE)  # (1, 14, H, W)
+            if arch == "unet_obs":
+                obs_feat = encode_obs_channels(seed_obs or [], width, height)
+                x = np.concatenate([features, obs_feat], axis=0)  # (21, H, W)
+            else:
+                x = features  # (14, H, W)
+            x = torch.tensor(x).unsqueeze(0).to(DEVICE)
             probs = model(x).squeeze(0)  # (6, H, W)
             cnn_pred = probs.permute(1, 2, 0).cpu().numpy()  # (H, W, 6)
         cnn_pred = np.maximum(cnn_pred, PROB_FLOOR)
@@ -263,15 +278,10 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
 
         # --- Bayesian blended prediction (CNN + observations) ---
         blend_pred = None
-        seed_obs = None
-        if round_id_short in obs_index:
-            all_obs = load_observations_list(round_id_short)
-            if all_obs:
-                seed_obs = [o for o in all_obs if o["seed_index"] == seed]
-                if seed_obs:
-                    blend_pred = bayesian_blend(
-                        cnn_pred, seed_obs, initial_grid, width, height
-                    )
+        if seed_obs:
+            blend_pred = bayesian_blend(
+                cnn_pred, seed_obs, initial_grid, width, height
+            )
 
         # --- Full-map metrics ---
         cnn_score_full, cnn_wkl_full = competition_score(cnn_pred, gt)

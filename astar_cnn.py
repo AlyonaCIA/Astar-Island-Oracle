@@ -246,12 +246,54 @@ class QuickCNN3(nn.Module):
         return probs
 
 
+OBS_CHANNELS = 7  # 6 class frequencies + 1 coverage
+
+
+def encode_obs_channels(observations, width, height):
+    """
+    Encode viewport observations into 7 extra input channels.
+
+    Channels 0-5: observed class frequency at each pixel (count[c] / total_obs)
+    Channel 6:    log(1 + total_observations) coverage indicator
+
+    Unobserved pixels are all zeros, so the network learns to fall back
+    to terrain-only prediction when no observations are available.
+
+    Returns: numpy array of shape (7, height, width)
+    """
+    obs_counts = np.zeros((NUM_CLASSES, height, width), dtype=np.float32)
+    obs_hits = np.zeros((height, width), dtype=np.float32)
+    mapping = {10: 0, 11: 0, 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
+
+    for obs in observations:
+        vp = obs["viewport"]
+        vx, vy = vp["x"], vp["y"]
+        grid = obs["grid"]
+        for dy in range(len(grid)):
+            for dx in range(len(grid[0])):
+                gy, gx = vy + dy, vx + dx
+                if 0 <= gy < height and 0 <= gx < width:
+                    cls = mapping.get(grid[dy][dx], 0)
+                    obs_counts[cls, gy, gx] += 1.0
+                    obs_hits[gy, gx] += 1.0
+
+    # Normalize counts to frequencies
+    mask = obs_hits > 0
+    for c in range(NUM_CLASSES):
+        obs_counts[c][mask] /= obs_hits[mask]
+
+    # Coverage channel
+    coverage = np.log1p(obs_hits)[np.newaxis, :, :]  # (1, H, W)
+
+    return np.concatenate([obs_counts, coverage], axis=0)  # (7, H, W)
+
+
 class MiniUNet(nn.Module):
     """Small U-Net for 40x40 maps. Encoder-decoder with skip connections."""
-    def __init__(self, dropout=0.2):
+    def __init__(self, dropout=0.2, in_channels=14):
         super().__init__()
         self.enc1 = nn.Sequential(
-            nn.Conv2d(14, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(),
             nn.Dropout2d(dropout),
             nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
         )
@@ -310,7 +352,9 @@ MODEL_REGISTRY = {
     "quick": QuickCNN,
     "quick3": QuickCNN3,
     "unet": MiniUNet,
-    "unet_aug": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1)),  # lower dropout for augmented training
+    "unet_aug": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1)),
+    "unet_obs": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1),
+                                       in_channels=14 + OBS_CHANNELS),
 }
 
 CHECKPOINT_DIR_MAP = {
@@ -318,6 +362,7 @@ CHECKPOINT_DIR_MAP = {
     "quick3": os.path.join(SCRIPT_DIR, "checkpoints_quick3"),
     "unet": os.path.join(SCRIPT_DIR, "checkpoints_unet"),
     "unet_aug": os.path.join(SCRIPT_DIR, "checkpoints_unet_aug"),
+    "unet_obs": os.path.join(SCRIPT_DIR, "checkpoints_unet_obs"),
 }
 
 MODEL_ARCH = os.environ.get("ASTAR_MODEL", "quick")
@@ -334,9 +379,9 @@ def make_model(arch="quick", **kwargs):
 
 def collect_observations(round_id, seeds_count, initial_states, width, height):
     """
-    Query the simulator using a non-overlapping tile partition with priority
-    ordering.  Assumes stochastic simulation: covers all tiles via round-robin,
-    then re-queries the most dynamic tiles with any remaining budget.
+    Query the simulator using a full-size viewport grid with priority ordering.
+    Assumes stochastic simulation: covers all tiles via round-robin, then
+    spends remaining budget on dynamic re-queries and interest-centred viewports.
     """
     budget = check_budget()
     if not budget:
@@ -430,9 +475,12 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
 
     # --- 4. Extra queries on most dynamic tiles ---
     if queries_done < query_limit and not past_deadline():
+        extra_budget = query_limit - queries_done
         print(f"  Full coverage done ({queries_done} queries). "
-              f"Using {query_limit - queries_done} extra queries on dynamic tiles.")
-        extra_targets = []
+              f"Using {extra_budget} extra queries on dynamic tiles.")
+
+        # Score each observed tile by change rate from initial state
+        tile_dynamics = []  # (change_rate, seed, tile_xywh)
         for s in range(seeds_count):
             grid = initial_states[s]["grid"]
             for obs in seed_obs[s]:
@@ -448,11 +496,44 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
                                 changes += 1
                             total += 1
                 if total > 0:
-                    extra_targets.append((changes / total, s,
+                    tile_dynamics.append((changes / total, s,
                                           (vp["x"], vp["y"], vp["w"], vp["h"])))
-        extra_targets.sort(reverse=True)
+        tile_dynamics.sort(reverse=True)
 
-        for change_rate, s, (tx, ty, tw, th) in extra_targets:
+        # Also generate interest-centered extra viewports (always 15×15)
+        extra_interest = []
+        for s in range(seeds_count):
+            grid = initial_states[s]["grid"]
+            queried_tiles = [(o["viewport"]["x"], o["viewport"]["y"],
+                              o["viewport"]["w"], o["viewport"]["h"])
+                             for o in seed_obs[s]]
+            interest_vps = compute_interest_viewports(
+                grid, width, height, existing_tiles=queried_tiles,
+                n_extra=max(2, extra_budget // seeds_count)
+            )
+            for ivp in interest_vps:
+                # Score by initial interest (approximate)
+                sc = score_tile(grid, ivp, width, height)
+                extra_interest.append((sc, s, ivp))
+        extra_interest.sort(reverse=True)
+
+        # Interleave: prioritise observed-dynamic re-queries, then interest viewports
+        extra_targets = []
+        di, ii = 0, 0
+        while len(extra_targets) < extra_budget:
+            added = False
+            if di < len(tile_dynamics):
+                extra_targets.append(tile_dynamics[di])
+                di += 1
+                added = True
+            if ii < len(extra_interest) and len(extra_targets) < extra_budget:
+                extra_targets.append(extra_interest[ii])
+                ii += 1
+                added = True
+            if not added:
+                break
+
+        for score_val, s, (tx, ty, tw, th) in extra_targets:
             if queries_done >= query_limit or past_deadline():
                 break
             try:
@@ -466,7 +547,7 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
                 used = result.get("queries_used", "?")
                 max_q = result.get("queries_max", "?")
                 print(f"  Extra: seed {s} ({vp['x']},{vp['y']}) {vp['w']}x{vp['h']}  "
-                      f"change_rate={change_rate:.2f}  budget {used}/{max_q}")
+                      f"score={score_val:.2f}  budget {used}/{max_q}")
 
                 if isinstance(used, int) and isinstance(max_q, int) and used >= max_q:
                     break
@@ -506,23 +587,28 @@ def _save_round_data(round_id, detail):
 
 def compute_tile_grid(width, height, max_tile=15):
     """
-    Non-overlapping tile partition covering the entire map.
-    For a 40x40 map with max_tile=15: 9 tiles (3x3) at
-      x=[0,15,30] widths=[15,15,10], y=[0,15,30] heights=[15,15,10].
+    Full-size viewport grid covering the entire map.
+    Every tile is max_tile × max_tile (no wasted viewport area).
+    Edge tiles are shifted inward so no pixel falls outside the map,
+    creating natural overlap instead of smaller edge tiles.
+
+    For a 40×40 map with max_tile=15: 9 tiles (3×3), all 15×15.
+      x=[0, 12, 25]  y=[0, 12, 25]  — overlap at edges instead of shrinkage.
     Returns list of (x, y, w, h) tuples.
     """
-    x_specs = []
-    x = 0
-    while x < width:
-        w = min(max_tile, width - x)
-        x_specs.append((x, w))
-        x += w
-    y_specs = []
-    y = 0
-    while y < height:
-        h = min(max_tile, height - y)
-        y_specs.append((y, h))
-        y += h
+    def axis_positions(length, tile_size):
+        if length <= tile_size:
+            return [(0, min(length, tile_size))]
+        n_tiles = -(-length // tile_size)  # ceil division
+        max_start = length - tile_size
+        positions = []
+        for i in range(n_tiles):
+            start = round(i * max_start / (n_tiles - 1)) if n_tiles > 1 else 0
+            positions.append((start, tile_size))
+        return positions
+
+    x_specs = axis_positions(width, max_tile)
+    y_specs = axis_positions(height, max_tile)
     return [(tx, ty, tw, th) for (ty, th) in y_specs for (tx, tw) in x_specs]
 
 
@@ -616,8 +702,92 @@ def rescore_tile(tile, initial_grid, seed_observations, width, height,
     return base_score + bonus
 
 
+def compute_interest_viewports(initial_grid, width, height, max_tile=15,
+                               existing_tiles=None, n_extra=5):
+    """
+    Generate extra viewport positions centred on the most dynamic/interesting
+    map regions.  Each viewport is always max_tile×max_tile, clamped to bounds.
+
+    Ranks every possible viewport position by an interest heatmap built from
+    the initial terrain, then returns the top-n positions that are most
+    different from the already-queried tiles.
+    """
+    # Build per-cell interest score
+    interest = np.zeros((height, width), dtype=np.float32)
+    for y in range(height):
+        for x in range(width):
+            cell = initial_grid[y][x]
+            if cell == 1:        # Settlement
+                interest[y, x] = 5.0
+            elif cell == 2:      # Port
+                interest[y, x] = 6.0
+            elif cell == 4:      # Forest
+                interest[y, x] = 0.3
+            elif cell in (0, 11):  # Plains
+                interest[y, x] = 0.5
+            # Ocean/Mountain stay 0
+
+    # Coastal bonus
+    for y in range(height):
+        for x in range(width):
+            if interest[y, x] > 0:
+                for ny, nx in [(y-1, x), (y+1, x), (y, x-1), (y, x+1)]:
+                    if 0 <= ny < height and 0 <= nx < width:
+                        if initial_grid[ny][nx] == 10:
+                            interest[y, x] += 0.3
+                            break
+
+    # Summed area table for fast viewport scoring
+    sat = np.zeros((height + 1, width + 1), dtype=np.float64)
+    for y in range(height):
+        for x in range(width):
+            sat[y+1, x+1] = interest[y, x] + sat[y, x+1] + sat[y+1, x] - sat[y, x]
+
+    def viewport_score(vx, vy, vw, vh):
+        return (sat[vy+vh, vx+vw] - sat[vy, vx+vw] - sat[vy+vh, vx] + sat[vy, vx])
+
+    # Existing tile centers for diversity penalty
+    existing_centers = []
+    if existing_tiles:
+        for (ex, ey, ew, eh) in existing_tiles:
+            existing_centers.append((ex + ew / 2.0, ey + eh / 2.0))
+
+    max_x = width - max_tile
+    max_y = height - max_tile
+    candidates = []
+    # Sample every possible position (stride 1 on a 40×40 map is only ~676 positions)
+    for vy in range(max(0, max_y) + 1):
+        for vx in range(max(0, max_x) + 1):
+            score = viewport_score(vx, vy, max_tile, max_tile)
+            # Diversity: penalise overlap with existing tile centers
+            cx, cy = vx + max_tile / 2.0, vy + max_tile / 2.0
+            for ecx, ecy in existing_centers:
+                dist = ((cx - ecx)**2 + (cy - ecy)**2) ** 0.5
+                if dist < max_tile:
+                    score *= (0.3 + 0.7 * dist / max_tile)  # mild penalty
+            candidates.append((score, vx, vy))
+
+    candidates.sort(reverse=True)
+
+    # Deduplicate: skip candidates too close to already selected ones
+    selected = []
+    for score, vx, vy in candidates:
+        if len(selected) >= n_extra:
+            break
+        cx, cy = vx + max_tile / 2.0, vy + max_tile / 2.0
+        too_close = False
+        for sx, sy in selected:
+            if abs(cx - (sx + max_tile/2.0)) < 3 and abs(cy - (sy + max_tile/2.0)) < 3:
+                too_close = True
+                break
+        if not too_close:
+            selected.append((vx, vy))
+
+    return [(vx, vy, max_tile, max_tile) for vx, vy in selected]
+
+
 def plan_viewports(width, height, num_queries, vw=15, vh=15):
-    """Legacy wrapper — returns (vx, vy) list from the non-overlapping grid."""
+    """Legacy wrapper — returns (vx, vy) list from the tile grid."""
     tiles = compute_tile_grid(width, height, max_tile=min(vw, vh))
     return [(tx, ty) for (tx, ty, tw, th) in tiles[:num_queries]]
 
@@ -658,9 +828,10 @@ def build_training_data(observations, initial_states, width, height):
         for dy in range(vh):
             for dx in range(vw):
                 y, x = vy + dy, vx + dx
-                cls = terrain_to_class(obs_grid[dy][dx])
-                X_pixels.append(features[:, y, x])
-                y_pixels.append(cls)
+                if 0 <= y < height and 0 <= x < width:
+                    cls = terrain_to_class(obs_grid[dy][dx])
+                    X_pixels.append(features[:, y, x])
+                    y_pixels.append(cls)
 
     # Add static cell samples from ALL seeds (ocean, mountain — known outcomes)
     for si in range(len(initial_states)):
@@ -765,16 +936,20 @@ def load_pretrained_checkpoint():
 
 # --- Prediction ---
 
-def predict_full_map(model, features, width, height):
+def predict_full_map(model, features, width, height, obs_features=None):
     """
     Run the trained CNN on the full feature map to get per-cell probabilities.
 
-    Input features: (14, H, W)
+    Input features: (C, H, W) — 14 channels for standard, 21 for obs-conditioned
+    obs_features: optional (7, H, W) observation channels to concatenate
     Output: (H, W, 6) numpy array of class probabilities
     """
     with torch.no_grad():
-        # Shape: (1, 14, H, W) — single batch
-        x = torch.tensor(features).unsqueeze(0).to(DEVICE)
+        if obs_features is not None:
+            x = np.concatenate([features, obs_features], axis=0)  # (21, H, W)
+        else:
+            x = features
+        x = torch.tensor(x).unsqueeze(0).to(DEVICE)
         probs = model(x)  # (1, 6, H, W)
         probs = probs.squeeze(0)  # (6, H, W)
         # Transpose to (H, W, 6) for submission
@@ -903,18 +1078,18 @@ def submit_fallback(round_id, seeds_count, initial_states, width, height):
 
 def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
                            seeds_count, width, height,
-                           observations=None):
+                           observations=None, arch=None):
     """Submit CNN-based predictions for all seeds (overwrites fallback).
 
-    If observations are provided, applies Bayesian blending to combine
-    CNN predictions with empirical observation data before submitting.
+    For unet_obs architecture, observations are encoded as extra input channels.
     """
-    label = "blended CNN+obs" if observations else "CNN"
+    is_obs_model = (arch == "unet_obs")
+    label = "obs-conditioned CNN" if is_obs_model and observations else "CNN"
     print(f"\n--- Submitting {label} predictions ---")
 
-    # Group observations by seed for blending
+    # Group observations by seed
+    obs_by_seed = {}
     if observations:
-        obs_by_seed = {}
         for obs in observations:
             sid = obs["seed_index"]
             obs_by_seed.setdefault(sid, []).append(obs)
@@ -928,14 +1103,15 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
                 initial_states[seed_idx]["grid"], width, height
             )
         features = encoded_grids[seed_idx]
-        prediction = predict_full_map(model, features, width, height)
 
-        # Bayesian blend if we have observations for this seed
-        if observations and seed_idx in obs_by_seed:
-            prediction = bayesian_blend(
-                prediction, obs_by_seed[seed_idx],
-                initial_states[seed_idx]["grid"], width, height,
-            )
+        # Build observation channels for obs-conditioned model
+        obs_feat = None
+        if is_obs_model:
+            seed_obs = obs_by_seed.get(seed_idx, [])
+            obs_feat = encode_obs_channels(seed_obs, width, height)
+
+        prediction = predict_full_map(model, features, width, height,
+                                      obs_features=obs_feat)
 
         try:
             result = submit_prediction(round_id, seed_idx, prediction)
@@ -1016,7 +1192,6 @@ def main():
             submit_cnn_predictions(
                 round_id, model, encoded_grids, initial_states,
                 seeds_count, width, height,
-                observations=observations if observations else None,
             )
         else:
             # No checkpoint — train from observations collected above

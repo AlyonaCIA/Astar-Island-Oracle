@@ -143,29 +143,34 @@ def blend_observations(prior, observations, width, height):
 # ---------------------------------------------------------------------------
 
 def compute_tile_grid(width, height, max_tile=15):
-    """Non-overlapping partition. 9 tiles for 40x40."""
-    x_specs, y_specs = [], []
-    x = 0
-    while x < width:
-        w = min(max_tile, width - x)
-        x_specs.append((x, w))
-        x += w
-    y = 0
-    while y < height:
-        h = min(max_tile, height - y)
-        y_specs.append((y, h))
-        y += h
+    """Full-size viewport grid. All tiles max_tile×max_tile, clamped to bounds."""
+    def axis_positions(length, tile_size):
+        if length <= tile_size:
+            return [(0, min(length, tile_size))]
+        n_tiles = -(-length // tile_size)  # ceil division
+        max_start = length - tile_size
+        positions = []
+        for i in range(n_tiles):
+            start = round(i * max_start / (n_tiles - 1)) if n_tiles > 1 else 0
+            positions.append((start, tile_size))
+        return positions
+
+    x_specs = axis_positions(width, max_tile)
+    y_specs = axis_positions(height, max_tile)
     return [(tx, ty, tw, th) for (ty, th) in y_specs for (tx, tw) in x_specs]
 
 
 def old_overlap_viewports(width, height, num_queries, vw=15, vh=15):
-    """Old strategy: overlapping grid with step=13, center tile first."""
+    """Old strategy: overlapping grid with step=13, center tile first.
+    Positions are clamped so every viewport stays fully inside the map."""
     viewports = []
     y_positions = list(range(0, height, vh - 2))  # step=13
     x_positions = list(range(0, width, vw - 2))
+    max_vx = max(0, width - vw)
+    max_vy = max(0, height - vh)
     for vy in y_positions:
         for vx in x_positions:
-            viewports.append((vx, vy, vw, vh))
+            viewports.append((min(vx, max_vx), min(vy, max_vy), vw, vh))
     cx, cy = (width - vw) // 2, (height - vh) // 2
     viewports.insert(0, (cx, cy, vw, vh))
     seen = set()
@@ -263,14 +268,10 @@ def strategy_old_overlap(initial_grid, ground_truth, width, height, budget,
     observations = []
     covered = set()
     for tx, ty, tw, th in viewports:
-        tw_actual = min(tw, width - tx)
-        th_actual = min(th, height - ty)
-        if tw_actual <= 0 or th_actual <= 0:
-            continue
-        obs = obs_fn(ground_truth, tx, ty, tw_actual, th_actual)
-        observations.append((obs, tx, ty, tw_actual, th_actual))
-        for dy in range(th_actual):
-            for dx in range(tw_actual):
+        obs = obs_fn(ground_truth, tx, ty, tw, th)
+        observations.append((obs, tx, ty, tw, th))
+        for dy in range(th):
+            for dx in range(tw):
                 covered.add((ty + dy, tx + dx))
     pred = blend_observations(prior, observations, width, height)
     coverage = len(covered) / (width * height) * 100
