@@ -1363,7 +1363,8 @@ def main():
                 return
 
             print(f"\n--- Training CNN ({time_remaining():.0f}s remaining) ---")
-            model = train_model(X, y)
+            # model = train_model(X, y)
+            model = train_unet_live(observations, initial_states, encoded_grids, width, height)
 
             if past_deadline():
                 print("\nDeadline reached after training. Fallback submission stands.")
