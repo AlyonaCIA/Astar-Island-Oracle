@@ -215,16 +215,6 @@ def run_pipeline():
     log.info("--- Loading model checkpoint(s) ---")
     model, epoch = load_unet_model()
 
-    # Try loading snapshot ensemble (last 3 checkpoints)
-    ensemble_models = None
-    try:
-        snapshots = astar_cnn.load_snapshot_ensemble(arch=ARCH, n_snapshots=3)
-        if len(snapshots) > 1:
-            ensemble_models = snapshots
-            log.info(f"Loaded {len(snapshots)}-model snapshot ensemble")
-    except Exception as e:
-        log.warning(f"Snapshot ensemble loading failed: {e}")
-
     if model is not None:
         log.info(f"Loaded model (epoch {epoch}, arch={ARCH}). Submitting predictions...")
         encoded_grids = {}
@@ -238,7 +228,6 @@ def run_pipeline():
                 seeds_count, width, height,
                 observations=observations,
                 arch=ARCH,
-                ensemble_models=ensemble_models,
             )
             log.info("Predictions submitted successfully.")
         except Exception as e:

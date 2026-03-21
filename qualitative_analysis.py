@@ -155,12 +155,15 @@ def predict_mc(gt_sample, K=1000, T=50, use_obs=True):
 def predict_unet_cond(gt_sample, use_obs=True):
     """
     Generate (H, W, 6) prediction tensor using UNet conditional model.
+    Matches eval_cnn.py pipeline: model inference → bayesian_blend.
     """
     from train_cnn import (
         encode_initial_grid, encode_obs_channels,
         load_model_from_checkpoint, get_checkpoint_dir,
+        PROB_FLOOR,
     )
     from eval_cnn import load_observations_list
+    from astar_cnn import bayesian_blend
 
     ckpt_dir = get_checkpoint_dir("unet_cond")
     # Prefer cnn_latest.pt, fallback to highest epoch
@@ -204,8 +207,20 @@ def predict_unet_cond(gt_sample, use_obs=True):
         probs = model(x).squeeze(0)  # (6, H, W)
         pred = probs.permute(1, 2, 0).cpu().numpy()  # (H, W, 6)
 
-    pred = np.maximum(pred, 0.01)
+    pred = np.maximum(pred, PROB_FLOOR)
     pred = pred / pred.sum(axis=-1, keepdims=True)
+
+    # Bayesian blend with observations (matches eval_cnn.py pipeline)
+    if seed_obs:
+        pred = bayesian_blend(pred, seed_obs, initial_grid, W, H)
+
+    # Mountains are static — hard-set to 1.0 for mountain class
+    for y in range(H):
+        for x_i in range(W):
+            if initial_grid[y][x_i] == 5:  # mountain
+                pred[y, x_i, :] = PROB_FLOOR
+                pred[y, x_i, 5] = 1.0 - (PROB_FLOOR * 5)
+
     return pred  # (H, W, 6)
 
 

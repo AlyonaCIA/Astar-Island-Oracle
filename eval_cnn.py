@@ -283,6 +283,16 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
                 cnn_pred, seed_obs, initial_grid, width, height
             )
 
+        # --- Mountain override (static terrain → 1.0 for mountain class) ---
+        for y in range(height):
+            for x_i in range(width):
+                if initial_grid[y][x_i] == 5:  # mountain
+                    cnn_pred[y, x_i, :] = PROB_FLOOR
+                    cnn_pred[y, x_i, 5] = 1.0 - (PROB_FLOOR * 5)
+                    if blend_pred is not None:
+                        blend_pred[y, x_i, :] = PROB_FLOOR
+                        blend_pred[y, x_i, 5] = 1.0 - (PROB_FLOOR * 5)
+
         # --- Full-map metrics ---
         cnn_score_full, cnn_wkl_full = competition_score(cnn_pred, gt)
         uni_score_full, uni_wkl_full = competition_score(uniform_pred, gt)
@@ -380,17 +390,18 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
     has_blend = any(r["bln_score_full"] is not None for r in results)
 
     print(f"\n{'='*90}")
-    print(f"  EVALUATION RESULTS  (val quadrant = {val_quadrant})")
+    print(f"  EVALUATION RESULTS  (val quadrant = {val_quadrant}, arch = {arch})")
     print(f"{'='*90}")
 
+    arch_label = arch.upper()
     bln_hdr = f" {'Blend':>7}" if has_blend else ""
     bln_hdr2 = f" {'Score':>7}" if has_blend else ""
     bln_vhdr = f" {'Bln val':>8}" if has_blend else ""
     bln_vhdr2 = f" {'KL':>8}" if has_blend else ""
 
     header = (f"  {'Round':>5} {'Seed':>4} | {'API':>6} | "
-              f"{'CNN':>7}{bln_hdr} {'Prior':>7} {'Unif':>7} | "
-              f"{'CNN val':>8}{bln_vhdr} {'Pri val':>8} {'Uni val':>8}")
+              f"{arch_label:>7}{bln_hdr} {'Prior':>7} {'Unif':>7} | "
+              f"{arch_label+' val':>8}{bln_vhdr} {'Pri val':>8} {'Uni val':>8}")
     print(header)
     print(f"  {'':>5} {'':>4} | {'Score':>6} | "
           f"{'Score':>7}{bln_hdr2} {'Score':>7} {'Score':>7} | "
@@ -443,8 +454,8 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
         print(f"  VIEWPORT-ONLY RESULTS  (pixels you actually observed)")
         print(f"{'='*max(80, vp_sep+4)}")
         print(f"  {'Round':>5} {'Seed':>4} | {'Pixels':>6} | "
-              f"{'CNN':>7}{bvh} {'Prior':>7} {'Unif':>7} | "
-              f"{'CNN':>10}{bvw} {'Prior':>10} {'Unif':>10}")
+              f"{arch_label:>7}{bvh} {'Prior':>7} {'Unif':>7} | "
+              f"{arch_label:>10}{bvw} {'Prior':>10} {'Unif':>10}")
         print(f"  {'':>5} {'':>4} | {'':>6} | "
               f"{'Score':>7}{bvh2} {'Score':>7} {'Score':>7} | "
               f"{'WKL':>10}{bvw2} {'WKL':>10} {'WKL':>10}")
@@ -478,7 +489,7 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
                   f"{avg_vp_cnn_wkl:>10.5f}{bva_w} {avg_vp_pri_wkl:>10.5f} {avg_vp_uni_wkl:>10.5f}")
 
     # Per-class breakdown
-    print(f"\n  Per-class KL (CNN, val quadrant, averaged across seeds):")
+    print(f"\n  Per-class KL ({arch_label}, val quadrant, averaged across seeds):")
     print(f"  {'Class':>12} | {'KL':>10} | {'Pixels':>7}")
     print("  " + "-" * 36)
     for c in range(NUM_CLASSES):

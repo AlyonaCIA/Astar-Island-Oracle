@@ -202,27 +202,6 @@ def encode_initial_grid(initial_grid, width, height):
 
 # --- CNN Models ---
 
-class QuickCNN(nn.Module):
-    def __init__(self, dropout=0.2):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=14, out_channels=32, kernel_size=3, padding=1)
-        self.drop1 = nn.Dropout2d(p=dropout)
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
-        self.drop2 = nn.Dropout2d(p=dropout)
-        self.out_conv = nn.Conv2d(in_channels=32, out_channels=6, kernel_size=1)
-
-    def forward(self, x):
-        x = self.drop1(F.relu(self.conv1(x)))
-        x = self.drop2(F.relu(self.conv2(x)))
-        logits = self.out_conv(x)
-
-        # Convert logits to probabilities with safety floor
-        probs = F.softmax(logits, dim=1)
-        probs = torch.clamp(probs, min=PROB_FLOOR)
-        probs = probs / probs.sum(dim=1, keepdim=True)
-        return probs
-
-
 OBS_CHANNELS = 7  # 6 class frequencies + 1 coverage
 
 
@@ -300,7 +279,7 @@ class MiniUNet(nn.Module):
         )
         self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
 
-    def forward(self, x, temperature=0.6):
+    def forward(self, x, temperature=1.0):
         _, _, H, W = x.shape
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
@@ -328,20 +307,18 @@ class MiniUNet(nn.Module):
 
 
 MODEL_REGISTRY = {
-    "quick": QuickCNN,
     "unet_cond": lambda **kw: MiniUNet(dropout=kw.get('dropout', 0.1),
                                         in_channels=14 + OBS_CHANNELS),
 }
 
 CHECKPOINT_DIR_MAP = {
-    "quick": os.path.join(SCRIPT_DIR, "checkpoints"),
     "unet_cond": os.path.join(SCRIPT_DIR, "checkpoints_unet_cond"),
 }
 
-MODEL_ARCH = os.environ.get("ASTAR_MODEL", "quick")
+MODEL_ARCH = "unet_cond"
 
 
-def make_model(arch="quick", **kwargs):
+def make_model(arch="unet_cond", **kwargs):
     cls = MODEL_REGISTRY.get(arch)
     if cls is None:
         raise ValueError(f"Unknown architecture '{arch}'. Choose from: {list(MODEL_REGISTRY)}")
@@ -923,175 +900,29 @@ def load_pretrained_checkpoint():
 
 # --- Prediction ---
 
-def predict_full_map(model, features, width, height, obs_features=None, raw_observations=None):
+def predict_full_map(model, features, width, height, obs_features=None):
     """
-    Run the trained CNN, sharpen with temperature, and hard-override known pixels.
+    Run the CNN to produce (H, W, 6) probability predictions.
+    Observations are already encoded in obs_features (input channels).
+    No hard override — the model output is submitted directly.
     """
     with torch.no_grad():
         if obs_features is not None:
-            x = np.concatenate([features, obs_features], axis=0)  
+            x = np.concatenate([features, obs_features], axis=0)
         else:
             x = features
         x = torch.tensor(x).unsqueeze(0).to(DEVICE)
-        
-        # 1. Ask the U-Net for a sharpened prediction (Temperature = 0.6)
-        probs = model(x, temperature=0.6) 
-        probs = probs.squeeze(0)  
+
+        probs = model(x)  # temperature=1.0 (default)
+        probs = probs.squeeze(0)
         probs = probs.permute(1, 2, 0).cpu().numpy()
 
     # Safety: enforce floor and renormalize
     probs = np.maximum(probs, PROB_FLOOR)
     probs = probs / probs.sum(axis=-1, keepdims=True)
-
-    # 2. HARD OVERRIDE: If we observed a pixel with the API, don't let the AI guess.
-    # Set the observed class to 99% probability.
-    if raw_observations:
-        mapping = {10: 0, 11: 0, 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
-        for obs in raw_observations:
-            vp = obs["viewport"]
-            vx, vy = vp["x"], vp["y"]
-            obs_grid = obs["grid"]
-            for dy in range(len(obs_grid)):
-                for dx in range(len(obs_grid[0])):
-                    gy, gx = vy + dy, vx + dx
-                    if 0 <= gy < height and 0 <= gx < width:
-                        actual_code = obs_grid[dy][dx]
-                        actual_class = mapping.get(actual_code, 0)
-                        
-                        # Zero out all probabilities for this pixel
-                        probs[gy, gx, :] = PROB_FLOOR 
-                        # Set the known truth to ~99%
-                        probs[gy, gx, actual_class] = 1.0 - (PROB_FLOOR * 5)
-
     return probs
 
 
-# --- Ensemble Prediction ---
-
-def load_snapshot_ensemble(arch=None, n_snapshots=5):
-    """
-    Load the last N checkpoint snapshots for snapshot ensemble.
-    Returns list of (model, epoch) tuples.
-    """
-    a = arch or MODEL_ARCH
-    ckpt_dir = CHECKPOINT_DIR_MAP.get(a, CHECKPOINT_DIR)
-    if not os.path.isdir(ckpt_dir):
-        return []
-
-    files = [f for f in os.listdir(ckpt_dir)
-             if f.startswith("cnn_epoch_") and f.endswith(".pt")]
-    if not files:
-        return []
-
-    files.sort(key=lambda f: int(f.replace("cnn_epoch_", "").replace(".pt", "")),
-               reverse=True)
-    files = files[:n_snapshots]
-
-    models = []
-    for fname in files:
-        path = os.path.join(ckpt_dir, fname)
-        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
-        model_arch = ckpt.get("model_arch") or ckpt.get("metadata", {}).get("model_arch", a)
-        model = make_model(model_arch).to(DEVICE)
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.eval()
-        epoch = ckpt.get("epoch", 0)
-        models.append((model, epoch))
-
-    print(f"  Loaded {len(models)} snapshot models: "
-          f"epochs {[e for _, e in models]}")
-    return models
-
-
-def ensemble_predict(models, features, width, height, obs_features=None,
-                     temperature=1.0):
-    """
-    Average predictions from multiple models (snapshot ensemble).
-    Optionally applies temperature scaling before averaging.
-
-    Args:
-        models: list of (model, epoch) tuples
-        features: (14, H, W) terrain features
-        obs_features: optional (7, H, W) own-seed observations
-        temperature: softmax temperature (>1 = softer, <1 = sharper)
-
-    Returns: (H, W, 6) ensemble-averaged probability predictions
-    """
-    if not models:
-        return None
-
-    all_logits = []
-    with torch.no_grad():
-        for model, _ in models:
-            parts = [features]
-            if obs_features is not None:
-                parts.append(obs_features)
-            x = np.concatenate(parts, axis=0)
-            x_t = torch.tensor(x).unsqueeze(0).to(DEVICE)
-            # Get raw logits by running through model but extracting before softmax
-            # Since our models apply softmax internally, we work with log-probs
-            probs = model(x_t).squeeze(0)  # (6, H, W)
-            all_logits.append(probs)
-
-    # Average probabilities (with optional temperature scaling)
-    stacked = torch.stack(all_logits, dim=0)  # (K, 6, H, W)
-    if temperature != 1.0:
-        # Apply temperature to log-probabilities, then re-softmax
-        log_probs = torch.log(torch.clamp(stacked, min=1e-8))
-        scaled = F.softmax(log_probs / temperature, dim=1)
-        avg_probs = scaled.mean(dim=0)
-    else:
-        avg_probs = stacked.mean(dim=0)
-
-    result = avg_probs.permute(1, 2, 0).cpu().numpy()
-    result = np.maximum(result, PROB_FLOOR)
-    result = result / result.sum(axis=-1, keepdims=True)
-    return result
-
-
-def learn_temperature(models, features_list, targets_list, width, height,
-                      obs_features_list=None):
-    """
-    Learn optimal temperature T that minimizes KL divergence on validation data.
-    Uses simple grid search over [0.5, 2.0].
-
-    Args:
-        models: list of (model, epoch) tuples
-        features_list: list of (C, H, W) feature arrays
-        targets_list: list of (H, W, 6) ground truth probability arrays
-        obs_features_list: optional list of (7, H, W) observation arrays
-
-    Returns: optimal temperature (float)
-    """
-    if not models or not features_list:
-        return 1.0
-
-    best_t = 1.0
-    best_kl = float("inf")
-
-    for t in [0.5, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.5, 2.0]:
-        total_kl = 0.0
-        for i, (feat, target) in enumerate(zip(features_list, targets_list)):
-            obs_f = obs_features_list[i] if obs_features_list else None
-            pred = ensemble_predict(models, feat, width, height,
-                                    obs_features=obs_f,
-                                    temperature=t)
-            # KL divergence
-            p = np.clip(target, 1e-8, None)
-            q = np.clip(pred, 1e-8, None)
-            kl = (p * (np.log(p) - np.log(q))).sum(axis=-1)
-            ent = -(p * np.log(p)).sum(axis=-1)
-            total_ent = ent.sum()
-            if total_ent > 1e-12:
-                total_kl += (kl * ent).sum() / total_ent
-
-        avg_kl = total_kl / max(len(features_list), 1)
-        if avg_kl < best_kl:
-            best_kl = avg_kl
-            best_t = t
-
-    print(f"  Optimal temperature: {best_t:.1f} (wKL={best_kl:.6f})")
-    return best_t
 
 
 # --- Bayesian Blending ---
@@ -1211,23 +1042,13 @@ def submit_fallback(round_id, seeds_count, initial_states, width, height):
 
 def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
                            seeds_count, width, height,
-                           observations=None, arch=None,
-                           ensemble_models=None, temperature=1.0):
-    """Submit CNN-based predictions for all seeds (overwrites fallback).
+                           observations=None, arch=None, **_kwargs):
+    """Submit UNet predictions for all seeds (overwrites fallback).
 
-    For unet_cond architecture, observations are encoded as input channels.
-    If ensemble_models is provided, uses snapshot ensemble averaging.
+    Observations are encoded as input channels for the unet_cond model.
+    Post-processing: bayesian blend + mountain override (matches eval_cnn.py).
     """
-    is_obs_model = (arch == "unet_cond")
-    use_ensemble = ensemble_models and len(ensemble_models) > 1
-
-    if use_ensemble:
-        label = f"ensemble ({len(ensemble_models)} snapshots, T={temperature:.1f})"
-    elif is_obs_model and observations:
-        label = "obs-conditioned CNN"
-    else:
-        label = "CNN"
-    print(f"\n--- Submitting {label} predictions ---")
+    print(f"\n--- Submitting UNet predictions (arch={arch or MODEL_ARCH}) ---")
 
     # Group observations by seed
     obs_by_seed = {}
@@ -1246,21 +1067,26 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
             )
         features = encoded_grids[seed_idx]
 
-        # Build observation channels for unet_cond
-        obs_feat = None
-        if is_obs_model:
-            seed_obs = obs_by_seed.get(seed_idx, [])
-            obs_feat = encode_obs_channels(seed_obs, width, height)
+        # Build observation channels
+        seed_obs = obs_by_seed.get(seed_idx, [])
+        obs_feat = encode_obs_channels(seed_obs, width, height)
 
-        if use_ensemble:
-            prediction = ensemble_predict(
-                ensemble_models, features, width, height,
-                obs_features=obs_feat,
-                temperature=temperature)
-        else:
-            prediction = predict_full_map(model, features, width, height,
-                                          obs_features=obs_feat,
-                                         raw_observations=seed_obs)
+        prediction = predict_full_map(model, features, width, height,
+                                      obs_features=obs_feat)
+
+        # Bayesian blend with observations
+        if seed_obs:
+            initial_grid = initial_states[seed_idx]["grid"]
+            prediction = bayesian_blend(prediction, seed_obs, initial_grid,
+                                        width, height)
+
+        # Mountain override (static terrain → 1.0 for mountain class)
+        initial_grid = initial_states[seed_idx]["grid"]
+        for y in range(height):
+            for x_i in range(width):
+                if initial_grid[y][x_i] == 5:  # mountain
+                    prediction[y, x_i, :] = PROB_FLOOR
+                    prediction[y, x_i, 5] = 1.0 - (PROB_FLOOR * 5)
 
         try:
             result = submit_prediction(round_id, seed_idx, prediction)
@@ -1325,57 +1151,26 @@ def main():
             print("\nDeadline reached after observations. Fallback submission stands.")
             return
 
-        # Step 5: Try loading pretrained checkpoint
-        print(f"\n--- Checking for pretrained checkpoint ---")
+        # Step 5: Load pretrained unet_cond checkpoint
+        print(f"\n--- Loading pretrained checkpoint (arch={MODEL_ARCH}) ---")
         model = load_pretrained_checkpoint()
 
-        if model is not None:
-            # Pretrained model found — use it directly for predictions
-            print(f"\n--- Submitting pretrained CNN predictions (arch={MODEL_ARCH}) ---")
-            encoded_grids = {}
-            for seed_idx in range(seeds_count):
-                encoded_grids[seed_idx] = encode_initial_grid(
-                    initial_states[seed_idx]["grid"], width, height
-                )
-            submit_cnn_predictions(
-                round_id, model, encoded_grids, initial_states,
-                seeds_count, width, height,
-                observations=observations,
-                arch=MODEL_ARCH,
+        if model is None:
+            print(f"\n  WARNING: No checkpoint found. Fallback submission stands.")
+            return
+
+        # Step 6: Encode grids and submit predictions
+        encoded_grids = {}
+        for seed_idx in range(seeds_count):
+            encoded_grids[seed_idx] = encode_initial_grid(
+                initial_states[seed_idx]["grid"], width, height
             )
-        else:
-            # No checkpoint — train from observations collected above
-            print(f"\n--- No pretrained checkpoint found, training from observations ---")
-
-            if not observations:
-                print("\nNo observations collected. Fallback submission stands.")
-                return
-
-            # Step 6: Encode grids for live training
-            print(f"\n--- Encoding grids ({time_remaining():.0f}s remaining) ---")
-            encoded_grids = {
-                s: encode_initial_grid(initial_states[s]["grid"], width, height) 
-                for s in range(seeds_count)
-            }
-
-            if past_deadline():
-                print("\nDeadline reached before training. Fallback submission stands.")
-                return
-
-            print(f"\n--- Training CNN ({time_remaining():.0f}s remaining) ---")
-            model = train_unet_live(observations, initial_states, encoded_grids, width, height)
-
-            if past_deadline():
-                print("\nDeadline reached after training. Fallback submission stands.")
-                return
-
-            # Step 7: Predict and resubmit (overwrites the fallback)
-            submit_cnn_predictions(
-                round_id, model, encoded_grids, initial_states,
-                seeds_count, width, height,
-                observations=observations,
-                arch="unet_cond"  # Hardcoded to match train_unet_live
-            )
+        submit_cnn_predictions(
+            round_id, model, encoded_grids, initial_states,
+            seeds_count, width, height,
+            observations=observations,
+            arch=MODEL_ARCH,
+        )
     except Exception as e:
         print(f"\nERROR in CNN pipeline: {e}")
         print("Fallback submission still stands — you will get a score.")
