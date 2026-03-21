@@ -58,7 +58,12 @@ CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
 NUM_CLASSES = 6
 PROB_FLOOR = 0.01
 TERRAIN_CODES = [0, 1, 2, 3, 4, 5, 10, 11]
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 
 # Training hyper-parameters (overridable via env)
 EPOCHS = int(os.environ.get("ASTAR_TRAIN_EPOCHS", "300"))
