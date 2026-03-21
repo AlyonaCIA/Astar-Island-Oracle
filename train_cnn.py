@@ -56,7 +56,7 @@ TOKEN = os.environ.get("ASTAR_TOKEN")
 DATA_DIR = os.path.join(SCRIPT_DIR, "data", "ground_truth")
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
 NUM_CLASSES = 6
-PROB_FLOOR = 0.01
+PROB_FLOOR = 1e-6
 TERRAIN_CODES = [0, 1, 2, 3, 4, 5, 10, 11]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -64,7 +64,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 EPOCHS = int(os.environ.get("ASTAR_TRAIN_EPOCHS", "300"))
 LR = float(os.environ.get("ASTAR_TRAIN_LR", "1e-3"))
 BATCH_SIZE = int(os.environ.get("ASTAR_TRAIN_BATCH", "64"))
-CHECKPOINT_EVERY = int(os.environ.get("ASTAR_CKPT_EVERY", "25"))  # epochs
+CHECKPOINT_EVERY = int(os.environ.get("ASTAR_CKPT_EVERY", "1000"))  # epochs
 VAL_QUADRANT = int(os.environ.get("ASTAR_VAL_QUADRANT", "3"))  # 0-3, which quadrant is val
 
 if not TOKEN:
@@ -523,7 +523,7 @@ def build_fullmap_datasets(all_data, val_quadrant=3):
 # ---------------------------------------------------------------------------
 
 OBS_DATA_DIR = os.path.join(SCRIPT_DIR, "data")
-REPLAY_DIR = os.path.join(SCRIPT_DIR, "simulation_replays")
+REPLAY_DIR = os.path.join(SCRIPT_DIR, "replays")
 _TERRAIN_TO_CLASS = {10: 0, 11: 0, 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
 
 
@@ -597,7 +597,10 @@ def _compute_tile_grid(width, height, max_tile=15):
 def _load_all_replays_by_round():
     """
     Load all replay final grids grouped by round.
-    Returns dict: round_id_short → {seed_index → final_grid}
+    Returns dict: round_id_short → [final_grid, ...]
+
+    Keeps ALL replays including duplicates for the same round+seed,
+    since each replay is an independent simulation run.
     """
     if not os.path.isdir(REPLAY_DIR):
         return {}
@@ -609,11 +612,10 @@ def _load_all_replays_by_round():
         with open(path) as f:
             data = json.load(f)
         rid = data['round_id'][:8]
-        sid = data['seed_index']
         final_grid = data['frames'][-1]['grid']
         if rid not in by_round:
-            by_round[rid] = {}
-        by_round[rid][sid] = final_grid
+            by_round[rid] = []
+        by_round[rid].append(final_grid)
     total = sum(len(v) for v in by_round.values())
     print(f"  Loaded {total} replay grids across {len(by_round)} rounds")
     return by_round
@@ -633,7 +635,7 @@ def sample_multi_replay_obs_channels(round_replays, width, height, vp_size=15):
     0.6/0.2/0.1/0.1) instead of binary 0/1 values from a single replay.
 
     Args:
-        round_replays: dict {seed_index → final_grid} (all replays for a round)
+        round_replays: list of final_grid arrays (all replays for a round)
         width, height: map dimensions
         vp_size: viewport size (default 15)
 
@@ -643,7 +645,7 @@ def sample_multi_replay_obs_channels(round_replays, width, height, vp_size=15):
     obs_counts = np.zeros((NUM_CLASSES, height, width), dtype=np.float32)
     obs_hits = np.zeros((height, width), dtype=np.float32)
 
-    available_grids = list(round_replays.values())
+    available_grids = round_replays
     if not available_grids:
         # No replays: return zeros
         coverage = np.zeros((1, height, width), dtype=np.float32)
@@ -711,7 +713,7 @@ def build_fullmap_datasets_cond(all_data, copies_per_map=3):
         terrain_feat = encode_initial_grid(initial_grid, width, height)  # (14, H, W)
         gt = np.array(ground_truth, dtype=np.float32).transpose(2, 0, 1)  # (6, H, W)
 
-        round_replays = all_replays.get(round_id_short, {})
+        round_replays = all_replays.get(round_id_short, [])
 
         if round_replays:
             n_with_replay += 1

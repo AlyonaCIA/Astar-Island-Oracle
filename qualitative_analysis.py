@@ -9,14 +9,9 @@ For each sample, produces a 2×6 grid:
 
 Color encodes class identity; brightness encodes probability.
 
-Supports two methods:
-  --method mc        Monte Carlo dynamics (DynamicsCNN + rollouts)
-  --method unet_cond UNet conditional (MiniUNet direct prediction)
-
 Usage:
-    python qualitative_analysis.py --method mc --round 1 --seed 0
-    python qualitative_analysis.py --method unet_cond --round 1 --seed 0
-    python qualitative_analysis.py --method mc --all
+    python qualitative_analysis.py --round 1 --seed 0
+    python qualitative_analysis.py --all
 """
 
 import os
@@ -36,7 +31,6 @@ sys.path.insert(0, SCRIPT_DIR)
 # ---------------------------------------------------------------------------
 GT_DIR = os.path.join(SCRIPT_DIR, "data", "ground_truth")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-QUICK_MODEL_PATH = os.path.join(SCRIPT_DIR, "quick_check_model.pt")
 
 CLASS_NAMES = [
     "Empty/Ocean/Plains",
@@ -94,58 +88,6 @@ def find_sample(gt_data, round_num, seed_idx):
         if g.get("_round_number") == round_num and g.get("_seed_index") == seed_idx:
             return g
     return None
-
-
-# ---------------------------------------------------------------------------
-# Prediction generation: Monte Carlo
-# ---------------------------------------------------------------------------
-
-def predict_mc(gt_sample, K=1000, T=50, use_obs=True):
-    """
-    Generate (H, W, 6) prediction tensor using MC dynamics rollouts.
-    """
-    from monte_carlo_cond import (
-        DynamicsCNN, rollout_trajectories, aggregate_predictions_fast,
-        aggregate_observations, score_rollouts, normalize_weights,
-        load_observations, grid_to_class_indices,
-    )
-
-    model = DynamicsCNN().to(DEVICE)
-    if not os.path.exists(QUICK_MODEL_PATH):
-        print(f"ERROR: No saved MC model found at {QUICK_MODEL_PATH}")
-        print("Run: python quick_check.py --epochs 300 --skip-fetch")
-        sys.exit(1)
-    model.load_state_dict(torch.load(QUICK_MODEL_PATH, map_location=DEVICE,
-                                     weights_only=True))
-    model.eval()
-
-    H, W = gt_sample["height"], gt_sample["width"]
-    initial_grid = gt_sample["initial_grid"]
-    rid = gt_sample.get("_round_id", "")
-    seed = gt_sample.get("_seed_index", 0)
-
-    print(f"  Running {K} MC rollouts x {T} steps...")
-    trajectories = rollout_trajectories(model, initial_grid, H, W, K, T)
-
-    weights = np.ones(K, dtype=np.float64) / K
-    if use_obs and rid:
-        all_obs = load_observations(rid)
-        seed_obs = [o for o in all_obs if o.get("seed_index") == seed]
-        if seed_obs:
-            obs_probs, obs_total = aggregate_observations(seed_obs, H, W)
-            initial_indices = grid_to_class_indices(initial_grid, H, W)
-            log_weights = score_rollouts(trajectories, obs_probs, obs_total,
-                                         initial_indices)
-            weights = normalize_weights(log_weights)
-            ess = 1.0 / (weights ** 2).sum()
-            print(f"  Obs weighting: {len(seed_obs)} viewports, ESS={ess:.1f}/{K}")
-        else:
-            print(f"  No observations found for this seed — uniform weights")
-    else:
-        print(f"  Uniform weights (no observation weighting)")
-
-    pred = aggregate_predictions_fast(trajectories, weights, H, W)
-    return pred  # (H, W, 6)
 
 
 # ---------------------------------------------------------------------------
@@ -308,19 +250,12 @@ def compute_score(pred, gt):
 def main():
     parser = argparse.ArgumentParser(
         description="Qualitative analysis: prediction vs ground truth")
-    parser.add_argument("--method", choices=["mc", "unet_cond"],
-                        default="mc",
-                        help="Prediction method (default: mc)")
     parser.add_argument("--round", type=int, default=None,
                         help="Round number to visualize")
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed index to visualize")
     parser.add_argument("--all", action="store_true",
                         help="Visualize all available GT samples")
-    parser.add_argument("--rollouts", "-K", type=int, default=1000,
-                        help="MC rollouts per sample (default: 1000)")
-    parser.add_argument("--steps", "-T", type=int, default=50,
-                        help="MC rollout steps (default: 50)")
     parser.add_argument("--no-obs", action="store_true",
                         help="Disable observation weighting")
     parser.add_argument("--save-dir", type=str, default=None,
@@ -337,7 +272,7 @@ def main():
     print(f"Loaded {len(gt_data)} ground truth samples")
 
     use_obs = not args.no_obs
-    method_label = "Monte Carlo" if args.method == "mc" else "UNet Cond"
+    method_label = "UNet Cond"
 
     # Determine which samples to process
     if args.all:
@@ -369,11 +304,7 @@ def main():
 
         gt_tensor = np.array(gt_sample["ground_truth"], dtype=np.float32)
 
-        if args.method == "mc":
-            pred = predict_mc(gt_sample, K=args.rollouts, T=args.steps,
-                              use_obs=use_obs)
-        else:
-            pred = predict_unet_cond(gt_sample, use_obs=use_obs)
+        pred = predict_unet_cond(gt_sample, use_obs=use_obs)
 
         score, wkl = compute_score(pred, gt_tensor)
         print(f"  Score: {score:.2f} | wKL: {wkl:.6f}")
@@ -381,7 +312,7 @@ def main():
         save_path = None
         if save_dir:
             save_path = os.path.join(
-                save_dir, f"{args.method}_r{rnum}_s{seed}.png")
+                save_dir, f"unet_cond_r{rnum}_s{seed}.png")
 
         plot_comparison(pred, gt_tensor, rnum, seed, method_label,
                         save_path=save_path)

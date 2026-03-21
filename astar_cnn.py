@@ -62,7 +62,7 @@ session = requests.Session()
 session.headers["Authorization"] = f"Bearer {TOKEN}"
 
 NUM_CLASSES = 6
-PROB_FLOOR = 0.01
+PROB_FLOOR = 1e-6
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") if TORCH_AVAILABLE else None
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
