@@ -803,111 +803,91 @@ def plan_viewports(width, height, num_queries, vw=15, vh=15):
 
 # --- Training ---
 
-def build_training_data(observations, initial_states, width, height):
-    """
-    Build pixel-level training pairs from observations.
-
-    For each observed cell: input = 14-channel feature vector at that cell,
-    target = observed class index.
-
-    Also generates "static" training samples from cells we know won't change
-    (ocean, mountain) across the full map to anchor the model.
-    """
-    # Pre-encode all initial grids
-    encoded_grids = {}
-    for obs in observations:
-        si = obs["seed_index"]
-        if si not in encoded_grids:
-            encoded_grids[si] = encode_initial_grid(
-                initial_states[si]["grid"], width, height
-            )
-
-    # Collect pixel samples from observations
-    X_pixels = []  # (14,) feature vectors
-    y_pixels = []  # class index
-
-    for obs in observations:
-        si = obs["seed_index"]
-        features = encoded_grids[si]
-        vp = obs["viewport"]
-        vx, vy = vp["x"], vp["y"]
-        obs_grid = obs["grid"]
-        vh, vw = len(obs_grid), len(obs_grid[0])
-
-        for dy in range(vh):
-            for dx in range(vw):
-                y, x = vy + dy, vx + dx
-                if 0 <= y < height and 0 <= x < width:
-                    cls = terrain_to_class(obs_grid[dy][dx])
-                    X_pixels.append(features[:, y, x])
-                    y_pixels.append(cls)
-
-    # Add static cell samples from ALL seeds (ocean, mountain — known outcomes)
-    for si in range(len(initial_states)):
-        if si not in encoded_grids:
-            encoded_grids[si] = encode_initial_grid(
-                initial_states[si]["grid"], width, height
-            )
-        features = encoded_grids[si]
-        grid = initial_states[si]["grid"]
-        for y in range(height):
-            for x in range(width):
-                cell = grid[y][x]
-                if cell == 10:  # Ocean → class 0
-                    X_pixels.append(features[:, y, x])
-                    y_pixels.append(0)
-                elif cell == 5:  # Mountain → class 5
-                    X_pixels.append(features[:, y, x])
-                    y_pixels.append(5)
-
-    X = np.array(X_pixels, dtype=np.float32)
-    y = np.array(y_pixels, dtype=np.int64)
-    print(f"Training data: {len(X)} pixel samples ({len(observations)} viewports + static cells)")
-    return X, y, encoded_grids
-
-
-def train_model(X, y, epochs=80, lr=1e-3, batch_size=512):
-    """Train the CNN on pixel-level data. Stops early if deadline approached."""
-    model = make_model(MODEL_ARCH).to(DEVICE)
-
-    X_t = torch.tensor(X).unsqueeze(-1).unsqueeze(-1).to(DEVICE)
-    y_t = torch.tensor(y).to(DEVICE)
-
-    dataset = TensorDataset(X_t, y_t)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
+def train_unet_live(observations, initial_states, encoded_grids, width, height, epochs=80, lr=1e-3):
+    """Trains the U-Net on full 40x40 maps using a masked loss for observed regions."""
+    model = make_model("unet_cond").to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.NLLLoss()
+    loss_fn = nn.NLLLoss(reduction='none') # 'none' allows us to apply the observation mask
 
-    # Reserve 60s for prediction + submission
+    # Group observations by seed
+    obs_by_seed = {}
+    for obs in observations:
+        sid = obs["seed_index"]
+        obs_by_seed.setdefault(sid, []).append(obs)
+
     min_remaining = 60
-
     model.train()
+
     for epoch in range(epochs):
         if time_remaining() < min_remaining:
             print(f"  Stopping training at epoch {epoch+1}/{epochs} — deadline approaching")
             break
 
         total_loss = 0.0
-        n_batches = 0
-        for X_batch, y_batch in loader:
+        n_seeds = 0
+
+        # Train one full map (seed) at a time
+        for seed_idx, seed_obs in obs_by_seed.items():
+            if not seed_obs:
+                continue
+
+            # 1. Prepare Inputs
+            features = encoded_grids[seed_idx]
+            obs_features = encode_obs_channels(seed_obs, width, height)
+            x = np.concatenate([features, obs_features], axis=0) # (21, 40, 40)
+            X_t = torch.tensor(x).unsqueeze(0).to(DEVICE)        # (1, 21, 40, 40)
+
+            # 2. Prepare Targets & Mask
+            target_grid = np.zeros((height, width), dtype=np.int64)
+            mask_grid = np.zeros((height, width), dtype=np.float32)
+
+            for obs in seed_obs:
+                vp = obs["viewport"]
+                vx, vy = vp["x"], vp["y"]
+                grid = obs["grid"]
+                for dy in range(len(grid)):
+                    for dx in range(len(grid[0])):
+                        gy, gx = vy + dy, vx + dx
+                        if 0 <= gy < height and 0 <= gx < width:
+                            target_grid[gy, gx] = terrain_to_class(grid[dy][dx])
+                            mask_grid[gy, gx] = 1.0 # Mark this pixel as "observed"
+
+            # Add static cells to mask
+            initial_grid = initial_states[seed_idx]["grid"]
+            for y in range(height):
+                for x in range(width):
+                    cell = initial_grid[y][x]
+                    if cell == 10:  # Ocean
+                        target_grid[y, x] = 0
+                        mask_grid[y, x] = 1.0
+                    elif cell == 5: # Mountain
+                        target_grid[y, x] = 5
+                        mask_grid[y, x] = 1.0
+
+            Y_t = torch.tensor(target_grid).unsqueeze(0).to(DEVICE) 
+            Mask_t = torch.tensor(mask_grid).unsqueeze(0).to(DEVICE)
+
+            # 3. Forward Pass & Masked Loss
             optimizer.zero_grad()
-            probs = model(X_batch)
-            probs = probs.squeeze(-1).squeeze(-1)
-            loss = loss_fn(torch.log(probs.clamp(min=1e-8)), y_batch)
-            loss.backward()
+            probs = model(X_t) 
+            
+            log_probs = torch.log(probs.clamp(min=1e-8))
+            raw_loss = loss_fn(log_probs, Y_t) 
+            
+            masked_loss = (raw_loss * Mask_t).sum() / Mask_t.sum().clamp(min=1.0)
+            
+            masked_loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-            n_batches += 1
+            
+            total_loss += masked_loss.item()
+            n_seeds += 1
 
         if (epoch + 1) % 20 == 0 or epoch == 0:
-            avg_loss = total_loss / max(n_batches, 1)
-            remaining = time_remaining()
-            print(f"  Epoch {epoch+1}/{epochs} — loss: {avg_loss:.4f} ({remaining:.0f}s left)")
+            avg_loss = total_loss / max(n_seeds, 1)
+            print(f"  Epoch {epoch+1}/{epochs} — loss: {avg_loss:.4f} ({time_remaining():.0f}s left)")
 
     model.eval()
     return model
-
 
 # --- Checkpoint loading ---
 
