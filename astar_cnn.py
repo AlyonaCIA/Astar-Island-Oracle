@@ -869,7 +869,7 @@ def train_unet_live(observations, initial_states, encoded_grids, width, height, 
 
             # 3. Forward Pass & Masked Loss
             optimizer.zero_grad()
-            probs = model(X_t) 
+            probs = model(X_t, temperature=1.0) 
             
             log_probs = torch.log(probs.clamp(min=1e-8))
             raw_loss = loss_fn(log_probs, Y_t) 
@@ -1331,7 +1331,6 @@ def main():
 
         if model is not None:
             # Pretrained model found — use it directly for predictions
-            # Pass observations so unet_cond can use them as input channels
             print(f"\n--- Submitting pretrained CNN predictions (arch={MODEL_ARCH}) ---")
             encoded_grids = {}
             for seed_idx in range(seeds_count):
@@ -1352,18 +1351,18 @@ def main():
                 print("\nNo observations collected. Fallback submission stands.")
                 return
 
-            # Step 6: Build training data and train CNN
-            print(f"\n--- Building training data ({time_remaining():.0f}s remaining) ---")
-            X, y, encoded_grids = build_training_data(
-                observations, initial_states, width, height
-            )
+            # Step 6: Encode grids for live training
+            print(f"\n--- Encoding grids ({time_remaining():.0f}s remaining) ---")
+            encoded_grids = {
+                s: encode_initial_grid(initial_states[s]["grid"], width, height) 
+                for s in range(seeds_count)
+            }
 
             if past_deadline():
                 print("\nDeadline reached before training. Fallback submission stands.")
                 return
 
             print(f"\n--- Training CNN ({time_remaining():.0f}s remaining) ---")
-            # model = train_model(X, y)
             model = train_unet_live(observations, initial_states, encoded_grids, width, height)
 
             if past_deadline():
@@ -1375,7 +1374,7 @@ def main():
                 round_id, model, encoded_grids, initial_states,
                 seeds_count, width, height,
                 observations=observations,
-                arch=MODEL_ARCH
+                arch="unet_cond"  # Hardcoded to match train_unet_live
             )
     except Exception as e:
         print(f"\nERROR in CNN pipeline: {e}")
