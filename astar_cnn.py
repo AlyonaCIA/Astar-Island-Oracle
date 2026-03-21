@@ -925,9 +925,6 @@ def predict_full_map(model, features, width, height, obs_features=None):
         probs = probs.squeeze(0)
         probs = probs.permute(1, 2, 0).cpu().numpy()
 
-    # Safety: enforce floor and renormalize
-    probs = np.maximum(probs, PROB_FLOOR)
-    probs = probs / probs.sum(axis=-1, keepdims=True)
     return probs
 
 
