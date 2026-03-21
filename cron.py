@@ -11,7 +11,7 @@ Pipeline per round:
   5. Log observations to disk
   6. Wait 10 minutes for ground truth availability
   7. Fetch ground truth from completed rounds
-  8. Retrain UNet (up to 4,000 new epochs from last checkpoint)
+  8. Retrain UNet (2,000 additional epochs from last checkpoint)
   9. Sleep 20 minutes, repeat
 
 Usage:
@@ -40,7 +40,7 @@ import train_cnn
 ARCH = "unet_cond"                      # MiniUNet with multi-replay conditioned observation channels
 POLL_INTERVAL_S = 20 * 60              # 20 minutes between checks
 GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
-MAX_TRAIN_EPOCHS = 4_000               # max new epochs per training cycle
+ADDITIONAL_EPOCHS = 2_000              # additional epochs per training cycle
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "cron_state.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "cron.log")
@@ -259,7 +259,7 @@ def run_pipeline():
 
 
 def retrain():
-    """Fetch the latest ground truth and retrain the UNet from scratch."""
+    """Fetch the latest ground truth and continue training the UNet from the last checkpoint."""
 
     # 1. Fetch / refresh ground truth (all rounds, all seeds)
     log.info("--- Fetching ground truth from API ---")
@@ -274,12 +274,14 @@ def retrain():
         log.warning("No training data available. Skipping retraining.")
         return
 
+    current_epoch = get_current_epoch()
+    target_epoch = current_epoch + ADDITIONAL_EPOCHS
     log.info(f"Training data: {len(all_data)} samples (all rounds/seeds)")
-    log.info(f"Resuming training up to {MAX_TRAIN_EPOCHS} new epochs")
+    log.info(f"Resuming from epoch {current_epoch}, training to epoch {target_epoch} (+{ADDITIONAL_EPOCHS})")
 
     # 2. Resume training with all data
     original_epochs = train_cnn.EPOCHS
-    train_cnn.EPOCHS = MAX_TRAIN_EPOCHS
+    train_cnn.EPOCHS = target_epoch
 
     try:
         train_cnn.train(all_data, reset=False, forever=False, arch=ARCH, cv="all")
@@ -310,7 +312,7 @@ def main():
     log.info(f"  Device:        {astar_cnn.DEVICE}")
     log.info(f"  Poll interval: {POLL_INTERVAL_S // 60} min")
     log.info(f"  GT wait:       {GT_WAIT_S // 60} min")
-    log.info(f"  Max epochs/cycle: {MAX_TRAIN_EPOCHS}")
+    log.info(f"  Additional epochs/cycle: {ADDITIONAL_EPOCHS}")
     log.info(f"  Log file:      {LOG_FILE}")
     log.info(f"  State file:    {STATE_FILE}")
 
@@ -339,8 +341,8 @@ def main():
                 time.sleep(GT_WAIT_S)
                 retrain()
             elif first_cycle:
-                # First run: always retrain from scratch with existing data
-                log.info("First cycle — retraining from scratch with all "
+                # First run: always retrain with existing data
+                log.info("First cycle — continuing training with all "
                          "available ground truth...")
                 retrain()
 
