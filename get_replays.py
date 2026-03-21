@@ -2,12 +2,12 @@
 Download simulation replays from the Astar Island API.
 
 Fetches 5 replays (seed_index 0-4) for each completed round
-and stores them in the replays/ folder.
+and stores them in the replays/ folder. Each file includes a
+timestamp so re-running always adds new files without overwriting.
 
 Usage:
     python get_replays.py              # all completed rounds
     python get_replays.py --round 5    # specific round number
-    python get_replays.py --skip-existing  # skip already downloaded files
 """
 
 import os
@@ -16,6 +16,7 @@ import json
 import time
 import random
 import argparse
+from datetime import datetime
 import requests
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,12 +78,14 @@ def fetch_replay(round_id, seed_index):
 # Main
 # ---------------------------------------------------------------------------
 
-def replay_filename(round_number, seed_index):
-    return f"r{round_number}_s{seed_index}.json"
+def replay_filename(round_number, seed_index, timestamp):
+    return f"r{round_number}_s{seed_index}_{timestamp}.json"
 
 
-def download_replays(target_round=None, skip_existing=False):
+def download_replays(target_round=None):
     os.makedirs(REPLAYS_DIR, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("Fetching round list...")
     rounds = fetch_rounds()
@@ -99,7 +102,6 @@ def download_replays(target_round=None, skip_existing=False):
 
     total = len(completed) * SEEDS_PER_ROUND
     downloaded = 0
-    skipped = 0
     errors = 0
 
     for rnd in completed:
@@ -108,13 +110,8 @@ def download_replays(target_round=None, skip_existing=False):
         print(f"\n--- Round {round_number} (id={round_id}) ---")
 
         for seed_idx in range(SEEDS_PER_ROUND):
-            fname = replay_filename(round_number, seed_idx)
+            fname = replay_filename(round_number, seed_idx, timestamp)
             fpath = os.path.join(REPLAYS_DIR, fname)
-
-            if skip_existing and os.path.exists(fpath):
-                print(f"  [SKIP] {fname} (already exists)")
-                skipped += 1
-                continue
 
             try:
                 print(f"  Downloading {fname} ...", end=" ", flush=True)
@@ -130,15 +127,13 @@ def download_replays(target_round=None, skip_existing=False):
                 print(f"FAILED ({e})")
                 errors += 1
 
-    print(f"\nDone. Downloaded: {downloaded}, Skipped: {skipped}, Errors: {errors} (Total: {total})")
+    print(f"\nDone. Downloaded: {downloaded}, Errors: {errors} (Total: {total})")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download Astar Island replays")
     parser.add_argument("--round", type=int, default=None,
                         help="Download only this round number")
-    parser.add_argument("--skip-existing", action="store_true",
-                        help="Skip files that already exist")
     args = parser.parse_args()
 
-    download_replays(target_round=args.round, skip_existing=args.skip_existing)
+    download_replays(target_round=args.round)
