@@ -63,7 +63,15 @@ session.headers["Authorization"] = f"Bearer {TOKEN}"
 
 NUM_CLASSES = 6
 PROB_FLOOR = 1e-6
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") if TORCH_AVAILABLE else None
+if TORCH_AVAILABLE:
+    if torch.cuda.is_available():
+        DEVICE = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        DEVICE = torch.device("mps")
+    else:
+        DEVICE = torch.device("cpu")
+else:
+    DEVICE = None
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
 
@@ -1075,10 +1083,10 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
                                       obs_features=obs_feat)
 
         # Bayesian blend with observations
-        if seed_obs:
-            initial_grid = initial_states[seed_idx]["grid"]
-            prediction = bayesian_blend(prediction, seed_obs, initial_grid,
-                                        width, height)
+        # if seed_obs:
+        #     initial_grid = initial_states[seed_idx]["grid"]
+        #     prediction = bayesian_blend(prediction, seed_obs, initial_grid,
+        #                                 width, height)
 
         # Mountain override (static terrain → 1.0 for mountain class)
         initial_grid = initial_states[seed_idx]["grid"]

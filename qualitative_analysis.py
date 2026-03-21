@@ -30,7 +30,12 @@ sys.path.insert(0, SCRIPT_DIR)
 # Constants
 # ---------------------------------------------------------------------------
 GT_DIR = os.path.join(SCRIPT_DIR, "data", "ground_truth")
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 
 CLASS_NAMES = [
     "Empty/Ocean/Plains",
@@ -153,8 +158,8 @@ def predict_unet_cond(gt_sample, use_obs=True):
     pred = pred / pred.sum(axis=-1, keepdims=True)
 
     # Bayesian blend with observations (matches eval_cnn.py pipeline)
-    if seed_obs:
-        pred = bayesian_blend(pred, seed_obs, initial_grid, W, H)
+    # if seed_obs:
+    #     pred = bayesian_blend(pred, seed_obs, initial_grid, W, H)
 
     # Mountains are static — hard-set to 1.0 for mountain class
     for y in range(H):
