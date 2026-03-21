@@ -476,7 +476,8 @@ def _train_loop(X_train, Y_train, X_val, Y_val, epochs, lr, batch_size,
 # ---------------------------------------------------------------------------
 
 def rollout_trajectories(model, initial_grid, height, width,
-                         K=DEFAULT_K_ROLLOUTS, T=DEFAULT_T_STEPS):
+                         K=DEFAULT_K_ROLLOUTS, T=DEFAULT_T_STEPS,
+                         temperature=1.0):
     """
     Sample K stochastic trajectories of T steps from the initial map.
 
@@ -489,6 +490,8 @@ def rollout_trajectories(model, initial_grid, height, width,
         height, width: map dimensions
         K: number of rollouts
         T: number of timesteps
+        temperature: sampling temperature (< 1 = sharper/more deterministic,
+                     > 1 = softer/more stochastic, 1.0 = model raw probs)
 
     Returns:
         trajectories: (K, T+1, H, W) int64 numpy — terrain class indices per step
@@ -511,8 +514,11 @@ def rollout_trajectories(model, initial_grid, height, width,
             onehot = torch.zeros(K, NUM_TERRAIN, height, width, device=DEVICE)
             onehot.scatter_(1, current.unsqueeze(1), 1.0)
 
-            # Predict next-step probabilities: (K, 8, H, W)
-            probs = model.predict_probs(onehot)
+            # Predict next-step logits and apply temperature: (K, 8, H, W)
+            logits = model(onehot)
+            if temperature != 1.0:
+                logits = logits / temperature
+            probs = F.softmax(logits, dim=1)
 
             # Sample next state from categorical distribution
             # Reshape to (K*H*W, 8), sample, reshape back
@@ -632,10 +638,20 @@ def score_rollouts(trajectories, obs_probs, obs_total, initial_grid_indices,
     return log_weights
 
 
-def normalize_weights(log_weights):
-    """Softmax normalization of log weights. Returns (K,) normalized weights."""
-    log_weights = log_weights - log_weights.max()  # numerical stability
-    weights = np.exp(log_weights)
+def normalize_weights(log_weights, beta=1.0):
+    """Softmax normalization of log weights with tempering.
+
+    Args:
+        log_weights: (K,) raw log-likelihood scores
+        beta: tempering factor. 0 = uniform (ignore observations),
+              1 = standard, <1 = softer weighting (less ESS collapse),
+              >1 = sharper weighting.
+
+    Returns: (K,) normalized weights.
+    """
+    lw = beta * log_weights
+    lw = lw - lw.max()  # numerical stability
+    weights = np.exp(lw)
     total = weights.sum()
     if total < 1e-12:
         return np.ones_like(weights) / len(weights)
@@ -700,28 +716,104 @@ def aggregate_predictions_fast(trajectories, weights, height, width):
     return pred
 
 
+def blend_with_observations(pred, observations, height, width, kappa=3.0):
+    """
+    Blend MC prediction with empirical observation distribution.
+
+    Viewport observations are direct samples from the true simulation
+    distribution.  For cells observed n times, the empirical distribution
+    is a strong signal.  We blend:
+
+        final[y,x] = alpha * obs_empirical[y,x] + (1-alpha) * mc_pred[y,x]
+
+    where alpha = n / (n + kappa).  Larger kappa = more trust in the model.
+
+    Args:
+        pred: (H, W, 6) MC-weighted prediction (already in 6-class space)
+        observations: list of viewport observation dicts
+        height, width: map dimensions
+        kappa: blending strength.  kappa=3 means 3 observations gives 50/50.
+
+    Returns:
+        blended: (H, W, 6) blended prediction (floored + normalized)
+        n_blended: number of cells where blending was applied
+    """
+    if not observations:
+        return pred, 0
+
+    # Build empirical counts in 6-class space
+    obs_counts_6 = np.zeros((height, width, SUBMIT_CLASSES), dtype=np.float64)
+    obs_total = np.zeros((height, width), dtype=np.float64)
+
+    for obs in observations:
+        vp = obs["viewport"]
+        vx, vy = vp["x"], vp["y"]
+        grid = obs["grid"]
+        for dy in range(len(grid)):
+            for dx in range(len(grid[0])):
+                gy, gx = vy + dy, vx + dx
+                if 0 <= gy < height and 0 <= gx < width:
+                    terrain_code = grid[dy][dx]
+                    submit_cls = TERRAIN_TO_SUBMIT.get(terrain_code, 0)
+                    obs_counts_6[gy, gx, submit_cls] += 1.0
+                    obs_total[gy, gx] += 1.0
+
+    # Cells with at least one observation
+    observed_mask = obs_total > 0
+    n_blended = int(observed_mask.sum())
+    if n_blended == 0:
+        return pred, 0
+
+    # Empirical distribution (6-class)
+    obs_empirical = np.zeros_like(obs_counts_6)
+    for c in range(SUBMIT_CLASSES):
+        obs_empirical[:, :, c][observed_mask] = (
+            obs_counts_6[:, :, c][observed_mask] / obs_total[observed_mask]
+        )
+
+    # Blending weight per cell: alpha = n / (n + kappa)
+    alpha = np.zeros((height, width, 1), dtype=np.float64)
+    alpha[observed_mask, 0] = (
+        obs_total[observed_mask] / (obs_total[observed_mask] + kappa)
+    )
+
+    blended = pred.copy().astype(np.float64)
+    blended = alpha * obs_empirical + (1.0 - alpha) * blended
+
+    # Floor and renormalize
+    blended = np.maximum(blended, PROB_FLOOR).astype(np.float32)
+    blended = blended / blended.sum(axis=-1, keepdims=True)
+
+    return blended, n_blended
+
+
 # ---------------------------------------------------------------------------
 # End-to-end inference
 # ---------------------------------------------------------------------------
 
 def predict_round(model, initial_grid, height, width, observations,
-                  K=DEFAULT_K_ROLLOUTS, T=DEFAULT_T_STEPS):
+                  K=DEFAULT_K_ROLLOUTS, T=DEFAULT_T_STEPS,
+                  temperature=1.0, beta=1.0, kappa=3.0):
     """
     Full Monte Carlo conditional prediction for one seed.
 
-    1. Roll out K trajectories from initial map
-    2. Score against viewport observations
+    1. Roll out K trajectories from initial map (temperature-controlled)
+    2. Score against viewport observations (beta-tempered)
     3. Weight and aggregate into submission tensor
+    4. Blend with empirical observation distribution (kappa-controlled)
 
     Returns: (H, W, 6) probability tensor
     """
-    print(f"    Rolling out {K} trajectories for {T} steps...")
+    print(f"    Rolling out {K} trajectories for {T} steps "
+          f"(temp={temperature})...")
     t0 = time.time()
-    trajectories = rollout_trajectories(model, initial_grid, height, width, K, T)
+    trajectories = rollout_trajectories(model, initial_grid, height, width,
+                                        K, T, temperature=temperature)
     print(f"    Rollouts done in {time.time()-t0:.1f}s")
 
     if observations:
-        print(f"    Scoring against {len(observations)} viewport observations...")
+        print(f"    Scoring against {len(observations)} viewport observations "
+              f"(beta={beta})...")
         obs_probs, obs_total = aggregate_observations(observations, height, width)
         n_observed = int((obs_total > 0).sum())
         initial_indices = grid_to_class_indices(initial_grid, height, width)
@@ -733,7 +825,7 @@ def predict_round(model, initial_grid, height, width, observations,
 
         log_weights = score_rollouts(trajectories, obs_probs, obs_total,
                                      initial_indices)
-        weights = normalize_weights(log_weights)
+        weights = normalize_weights(log_weights, beta=beta)
 
         # Effective sample size (diagnostic)
         ess = 1.0 / (weights ** 2).sum()
@@ -743,6 +835,13 @@ def predict_round(model, initial_grid, height, width, observations,
         weights = np.ones(K, dtype=np.float64) / K
 
     pred = aggregate_predictions_fast(trajectories, weights, height, width)
+
+    # Blend with empirical observations
+    if observations:
+        pred, n_blended = blend_with_observations(
+            pred, observations, height, width, kappa=kappa)
+        print(f"    Observation blending: {n_blended} cells (kappa={kappa})")
+
     return pred
 
 

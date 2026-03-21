@@ -70,6 +70,7 @@ from monte_carlo_cond import (
     build_transition_dataset, load_all_replays, load_observations,
     rollout_trajectories, aggregate_predictions_fast,
     aggregate_observations, score_rollouts, normalize_weights,
+    blend_with_observations,
     entropy_per_pixel, kl_per_pixel, competition_score,
 )
 
@@ -307,10 +308,17 @@ def train_dynamics_all(replays, epochs=1000, lr=1e-3, batch_size=16):
 # STEP 2 — Evaluate against ground truth
 # ===================================================================
 
-def evaluate_against_gt(model, gt_data, K=1000, T=50, use_obs=False):
+def evaluate_against_gt(model, gt_data, K=1000, T=50, use_obs=False,
+                        temperature=1.0, beta=1.0, kappa=3.0):
     """
     For each GT sample, run MC rollouts and compare to ground truth tensor.
     If use_obs=True, load viewport observations and weight rollouts accordingly.
+
+    Args:
+        temperature: rollout sampling temperature (<1 sharper, >1 softer)
+        beta: observation score tempering (0=uniform, 1=standard, <1=softer)
+        kappa: observation blending strength (higher=more trust in model)
+
     Returns detailed per-sample results.
     """
     results = []
@@ -324,6 +332,8 @@ def evaluate_against_gt(model, gt_data, K=1000, T=50, use_obs=False):
     log.info(f"\n{'='*60}")
     log.info(f"  Evaluating {len(valid_samples)} GT samples")
     log.info(f"  K={K} rollouts, T={T} steps ({obs_label})")
+    if use_obs:
+        log.info(f"  temperature={temperature}, beta={beta}, kappa={kappa}")
     log.info(f"{'='*60}")
 
     for i, gt in enumerate(valid_samples):
@@ -340,7 +350,8 @@ def evaluate_against_gt(model, gt_data, K=1000, T=50, use_obs=False):
 
         # --- Rollouts ---
         t0 = time.time()
-        trajectories = rollout_trajectories(model, initial_grid, height, width, K, T)
+        trajectories = rollout_trajectories(model, initial_grid, height, width,
+                                            K, T, temperature=temperature)
         dt_rollout = time.time() - t0
         total_rollout_time += dt_rollout
         log.info(f"    Rollouts ({K}x{T} steps): {dt_rollout:.2f}s "
@@ -350,6 +361,7 @@ def evaluate_against_gt(model, gt_data, K=1000, T=50, use_obs=False):
         # --- Aggregation ---
         t0 = time.time()
 
+        seed_obs = []
         if use_obs:
             # Load viewport observations for this round+seed
             from monte_carlo_cond import grid_to_class_indices, _STATIC_CODES
@@ -363,11 +375,12 @@ def evaluate_against_gt(model, gt_data, K=1000, T=50, use_obs=False):
                     initial_grid, height, width)
                 log_weights = score_rollouts(
                     trajectories, obs_probs, obs_total, initial_indices)
-                weights = normalize_weights(log_weights)
+                weights = normalize_weights(log_weights, beta=beta)
                 ess = 1.0 / (weights ** 2).sum()
                 n_observed = int((obs_total > 0).sum())
                 log.info(f"    Obs weighting: {len(seed_obs)} viewports, "
-                         f"{n_observed} cells observed, ESS={ess:.1f}/{K}")
+                         f"{n_observed} cells observed, ESS={ess:.1f}/{K} "
+                         f"(beta={beta})")
             else:
                 log.info(f"    No observations for round {rid} seed {seed} "
                          f"— uniform weights")
@@ -376,6 +389,13 @@ def evaluate_against_gt(model, gt_data, K=1000, T=50, use_obs=False):
             weights = np.ones(K, dtype=np.float64) / K
 
         pred = aggregate_predictions_fast(trajectories, weights, height, width)
+
+        # --- Observation blending ---
+        if use_obs and seed_obs:
+            pred, n_blended = blend_with_observations(
+                pred, seed_obs, height, width, kappa=kappa)
+            log.info(f"    Obs blending: {n_blended} cells (kappa={kappa})")
+
         dt_aggregate = time.time() - t0
         total_aggregate_time += dt_aggregate
         log.info(f"    Aggregation: {dt_aggregate:.2f}s")
@@ -446,6 +466,15 @@ def main():
                         help="Weight rollouts using viewport observations")
     parser.add_argument("--load-model", action="store_true",
                         help="Load previously saved model (skip training)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Rollout sampling temperature (default: 1.0, "
+                             "<1 sharper, >1 softer)")
+    parser.add_argument("--beta", type=float, default=1.0,
+                        help="Observation score tempering (default: 1.0, "
+                             "0=ignore obs, <1=softer weighting)")
+    parser.add_argument("--kappa", type=float, default=3.0,
+                        help="Observation blending strength (default: 3.0, "
+                             "higher=more trust in model)")
     args = parser.parse_args()
 
     wall_start = time.time()
@@ -460,6 +489,10 @@ def main():
     log.info(f"  LR:           {args.lr}")
     log.info(f"  Batch:        {args.batch}")
     log.info(f"  Use obs:      {args.use_obs}")
+    if args.use_obs:
+        log.info(f"  Temperature:  {args.temperature}")
+        log.info(f"  Beta:         {args.beta}")
+        log.info(f"  Kappa:        {args.kappa}")
     log.info("")
 
     # ── STEP 0: Fetch fresh data ──
@@ -533,7 +566,8 @@ def main():
     log.info("─" * 60)
 
     results, dt_rollouts_total, dt_agg_total, dt_score_total = evaluate_against_gt(
-        model, valid_gt, K=args.rollouts, T=args.steps, use_obs=args.use_obs)
+        model, valid_gt, K=args.rollouts, T=args.steps, use_obs=args.use_obs,
+        temperature=args.temperature, beta=args.beta, kappa=args.kappa)
 
     # ── SUMMARY ──
     wall_total = time.time() - wall_start
