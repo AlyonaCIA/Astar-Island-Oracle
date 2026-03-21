@@ -943,28 +943,46 @@ def load_pretrained_checkpoint():
 
 # --- Prediction ---
 
-def predict_full_map(model, features, width, height, obs_features=None):
+def predict_full_map(model, features, width, height, obs_features=None, raw_observations=None):
     """
-    Run the trained CNN on the full feature map to get per-cell probabilities.
-
-    Input features: (C, H, W) — 14 channels for standard, 21 for obs-conditioned
-    obs_features: optional (7, H, W) observation channels to concatenate
-    Output: (H, W, 6) numpy array of class probabilities
+    Run the trained CNN, sharpen with temperature, and hard-override known pixels.
     """
     with torch.no_grad():
         if obs_features is not None:
-            x = np.concatenate([features, obs_features], axis=0)  # (21, H, W)
+            x = np.concatenate([features, obs_features], axis=0)  
         else:
             x = features
         x = torch.tensor(x).unsqueeze(0).to(DEVICE)
-        probs = model(x)  # (1, 6, H, W)
-        probs = probs.squeeze(0)  # (6, H, W)
-        # Transpose to (H, W, 6) for submission
+        
+        # 1. Ask the U-Net for a sharpened prediction (Temperature = 0.6)
+        probs = model(x, temperature=0.6) 
+        probs = probs.squeeze(0)  
         probs = probs.permute(1, 2, 0).cpu().numpy()
 
     # Safety: enforce floor and renormalize
     probs = np.maximum(probs, PROB_FLOOR)
     probs = probs / probs.sum(axis=-1, keepdims=True)
+
+    # 2. HARD OVERRIDE: If we observed a pixel with the API, don't let the AI guess.
+    # Set the observed class to 99% probability.
+    if raw_observations:
+        mapping = {10: 0, 11: 0, 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
+        for obs in raw_observations:
+            vp = obs["viewport"]
+            vx, vy = vp["x"], vp["y"]
+            obs_grid = obs["grid"]
+            for dy in range(len(obs_grid)):
+                for dx in range(len(obs_grid[0])):
+                    gy, gx = vy + dy, vx + dx
+                    if 0 <= gy < height and 0 <= gx < width:
+                        actual_code = obs_grid[dy][dx]
+                        actual_class = mapping.get(actual_code, 0)
+                        
+                        # Zero out all probabilities for this pixel
+                        probs[gy, gx, :] = PROB_FLOOR 
+                        # Set the known truth to ~99%
+                        probs[gy, gx, actual_class] = 1.0 - (PROB_FLOOR * 5)
+
     return probs
 
 
