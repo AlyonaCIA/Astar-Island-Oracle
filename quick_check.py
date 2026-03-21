@@ -67,12 +67,14 @@ session.headers["Authorization"] = f"Bearer {TOKEN}"
 # ---------------------------------------------------------------------------
 from monte_carlo_cond import (
     DynamicsCNN,
-    build_transition_dataset, load_all_replays,
+    build_transition_dataset, load_all_replays, load_observations,
     rollout_trajectories, aggregate_predictions_fast,
+    aggregate_observations, score_rollouts, normalize_weights,
     entropy_per_pixel, kl_per_pixel, competition_score,
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+QUICK_MODEL_PATH = os.path.join(SCRIPT_DIR, "quick_check_model.pt")
 
 # ---------------------------------------------------------------------------
 # Directories
@@ -294,6 +296,10 @@ def train_dynamics_all(replays, epochs=1000, lr=1e-3, batch_size=16):
     log.info(f"  Best loss:  {min(loss_history):.6f} (epoch {loss_history.index(min(loss_history))+1})")
     log.info(f"  Avg epoch time: {total_train_time/epochs:.2f}s")
 
+    # Auto-save trained model
+    torch.save(model.state_dict(), QUICK_MODEL_PATH)
+    log.info(f"  Model saved to {QUICK_MODEL_PATH}")
+
     return model, total_train_time
 
 
@@ -301,9 +307,10 @@ def train_dynamics_all(replays, epochs=1000, lr=1e-3, batch_size=16):
 # STEP 2 — Evaluate against ground truth
 # ===================================================================
 
-def evaluate_against_gt(model, gt_data, K=1000, T=50):
+def evaluate_against_gt(model, gt_data, K=1000, T=50, use_obs=False):
     """
     For each GT sample, run MC rollouts and compare to ground truth tensor.
+    If use_obs=True, load viewport observations and weight rollouts accordingly.
     Returns detailed per-sample results.
     """
     results = []
@@ -313,9 +320,10 @@ def evaluate_against_gt(model, gt_data, K=1000, T=50):
 
     valid_samples = [g for g in gt_data
                      if g.get("initial_grid") and g.get("ground_truth")]
+    obs_label = "WITH observation weighting" if use_obs else "no observation weighting"
     log.info(f"\n{'='*60}")
     log.info(f"  Evaluating {len(valid_samples)} GT samples")
-    log.info(f"  K={K} rollouts, T={T} steps (no observation weighting)")
+    log.info(f"  K={K} rollouts, T={T} steps ({obs_label})")
     log.info(f"{'='*60}")
 
     for i, gt in enumerate(valid_samples):
@@ -339,9 +347,34 @@ def evaluate_against_gt(model, gt_data, K=1000, T=50):
                  f"({dt_rollout/T*1000:.1f}ms/step, "
                  f"{K*T*height*width/dt_rollout/1e6:.1f}M cells/s)")
 
-        # --- Aggregation (uniform weights — no obs) ---
+        # --- Aggregation ---
         t0 = time.time()
-        weights = np.ones(K, dtype=np.float64) / K
+
+        if use_obs:
+            # Load viewport observations for this round+seed
+            from monte_carlo_cond import grid_to_class_indices, _STATIC_CODES
+            all_obs = load_observations(rid)
+            seed_obs = [o for o in all_obs if o.get("seed_index") == seed]
+
+            if seed_obs:
+                obs_probs, obs_total = aggregate_observations(
+                    seed_obs, height, width)
+                initial_indices = grid_to_class_indices(
+                    initial_grid, height, width)
+                log_weights = score_rollouts(
+                    trajectories, obs_probs, obs_total, initial_indices)
+                weights = normalize_weights(log_weights)
+                ess = 1.0 / (weights ** 2).sum()
+                n_observed = int((obs_total > 0).sum())
+                log.info(f"    Obs weighting: {len(seed_obs)} viewports, "
+                         f"{n_observed} cells observed, ESS={ess:.1f}/{K}")
+            else:
+                log.info(f"    No observations for round {rid} seed {seed} "
+                         f"— uniform weights")
+                weights = np.ones(K, dtype=np.float64) / K
+        else:
+            weights = np.ones(K, dtype=np.float64) / K
+
         pred = aggregate_predictions_fast(trajectories, weights, height, width)
         dt_aggregate = time.time() - t0
         total_aggregate_time += dt_aggregate
@@ -409,6 +442,10 @@ def main():
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--skip-fetch", action="store_true",
                         help="Skip API fetch, use local GT only")
+    parser.add_argument("--use-obs", action="store_true",
+                        help="Weight rollouts using viewport observations")
+    parser.add_argument("--load-model", action="store_true",
+                        help="Load previously saved model (skip training)")
     args = parser.parse_args()
 
     wall_start = time.time()
@@ -422,6 +459,7 @@ def main():
     log.info(f"  Steps (T):    {args.steps}")
     log.info(f"  LR:           {args.lr}")
     log.info(f"  Batch:        {args.batch}")
+    log.info(f"  Use obs:      {args.use_obs}")
     log.info("")
 
     # ── STEP 0: Fetch fresh data ──
@@ -458,7 +496,7 @@ def main():
         rounds_seen[rn] += 1
     log.info(f"  Rounds: {dict(sorted(rounds_seen.items()))}")
 
-    # ── STEP 1: Load replays + train ──
+    # ── STEP 1: Load replays + train (or load saved model) ──
     log.info("")
     log.info("─" * 60)
     log.info("  STEP 1: Train dynamics model on all replays")
@@ -469,12 +507,24 @@ def main():
     dt_load_replays = time.time() - t0
     log.info(f"  Loaded {len(replays)} replays in {dt_load_replays:.1f}s")
 
-    if not replays:
-        log.error("No replays found. Cannot train.")
-        return
-
-    model, dt_train = train_dynamics_all(
-        replays, epochs=args.epochs, lr=args.lr, batch_size=args.batch)
+    if args.load_model:
+        if not os.path.exists(QUICK_MODEL_PATH):
+            log.error(f"No saved model found at {QUICK_MODEL_PATH}. "
+                      f"Run without --load-model first.")
+            return
+        model = DynamicsCNN().to(DEVICE)
+        model.load_state_dict(torch.load(QUICK_MODEL_PATH,
+                                         map_location=DEVICE,
+                                         weights_only=True))
+        model.eval()
+        dt_train = 0.0
+        log.info(f"  Loaded saved model from {QUICK_MODEL_PATH}")
+    else:
+        if not replays:
+            log.error("No replays found. Cannot train.")
+            return
+        model, dt_train = train_dynamics_all(
+            replays, epochs=args.epochs, lr=args.lr, batch_size=args.batch)
 
     # ── STEP 2: Evaluate ──
     log.info("")
@@ -483,7 +533,7 @@ def main():
     log.info("─" * 60)
 
     results, dt_rollouts_total, dt_agg_total, dt_score_total = evaluate_against_gt(
-        model, valid_gt, K=args.rollouts, T=args.steps)
+        model, valid_gt, K=args.rollouts, T=args.steps, use_obs=args.use_obs)
 
     # ── SUMMARY ──
     wall_total = time.time() - wall_start
