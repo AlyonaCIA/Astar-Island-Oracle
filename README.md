@@ -89,7 +89,7 @@ The full solution lifecycle — from collecting training data through to submitt
                         │     ├─ Mountain override (deterministic)  │
                         │     └─ Submit H×W×6 per seed via API      │
                         │  5. Wait for ground truth availability    │
-                        │  6. Retrain (up to 4,000 new epochs)      │
+                        │  6. Retrain (+2,000 epochs from checkpoint)│
                         └───────────────────────────────────────────┘
 ```
 
@@ -308,7 +308,7 @@ What happens each cycle:
 2. Submits a prior-based fallback (guarantees a score even if the model fails)
 3. Spends the query budget collecting viewport observations
 4. Loads the latest `unet_cond` checkpoint, runs inference, and submits predictions per seed
-5. After the round closes, waits for ground truth, then retrains (up to 4,000 new epochs)
+5. After the round closes, waits for ground truth, then retrains (+2,000 epochs from last checkpoint)
 
 State is tracked in `cron_state.json` to avoid reprocessing the same round.
 
@@ -549,7 +549,7 @@ Runs every 20 minutes in a continuous loop:
 ├─ Collect observations (2-phase viewport strategy)
 ├─ Load pretrained checkpoint → submit CNN predictions
 ├─ Wait 10 min for ground truth availability
-└─ Retrain (up to 4,000 new epochs from latest checkpoint)
+└─ Retrain (+2,000 epochs from latest checkpoint)
 ```
 
 Configuration (in `cron.py`):
@@ -559,9 +559,9 @@ Configuration (in `cron.py`):
 | `ARCH` | `unet_cond` | Model architecture |
 | `POLL_INTERVAL_S` | 1200 (20 min) | Check interval |
 | `GT_WAIT_S` | 600 (10 min) | Wait for GT before retrain |
-| `MAX_TRAIN_EPOCHS` | 4000 | Max epochs per training cycle |
+| `ADDITIONAL_EPOCHS` | 2000 | Additional epochs per training cycle |
 
-Retraining resumes from the latest checkpoint (optimizer state, LR schedule preserved) and trains up to 4,000 additional epochs using `--cv all` (all data, no holdout).
+Retraining resumes from the latest checkpoint (optimizer state, LR schedule preserved) and trains 2,000 additional epochs using `--cv all` (all data, no holdout). The model continuously improves as new data arrives.
 
 ```bash
 python cron.py          # run forever
