@@ -300,7 +300,7 @@ class MiniUNet(nn.Module):
         )
         self.out_conv = nn.Conv2d(32, 6, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, temperature=0.6):
         _, _, H, W = x.shape
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
@@ -318,6 +318,8 @@ class MiniUNet(nn.Module):
 
         if pad_h or pad_w:
             logits = logits[:, :, :H, :W]
+        if temperature != 1.0:
+            logits = logits/temperature
 
         probs = F.softmax(logits, dim=1)
         probs = torch.clamp(probs, min=PROB_FLOOR)
