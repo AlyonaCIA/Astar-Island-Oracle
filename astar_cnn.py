@@ -1054,7 +1054,7 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
     """Submit UNet predictions for all seeds (overwrites fallback).
 
     Observations are encoded as input channels for the unet_cond model.
-    Post-processing: bayesian blend + mountain override (matches eval_cnn.py).
+    The raw CNN output is submitted directly (no post-processing).
     """
     print(f"\n--- Submitting UNet predictions (arch={arch or MODEL_ARCH}) ---")
 
@@ -1081,20 +1081,6 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
 
         prediction = predict_full_map(model, features, width, height,
                                       obs_features=obs_feat)
-
-        # Bayesian blend with observations
-        # if seed_obs:
-        #     initial_grid = initial_states[seed_idx]["grid"]
-        #     prediction = bayesian_blend(prediction, seed_obs, initial_grid,
-        #                                 width, height)
-
-        # Mountain override (static terrain → 1.0 for mountain class)
-        initial_grid = initial_states[seed_idx]["grid"]
-        for y in range(height):
-            for x_i in range(width):
-                if initial_grid[y][x_i] == 5:  # mountain
-                    prediction[y, x_i, :] = PROB_FLOOR
-                    prediction[y, x_i, 5] = 1.0 - (PROB_FLOOR * 5)
 
         try:
             result = submit_prediction(round_id, seed_idx, prediction)
