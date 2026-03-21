@@ -1279,7 +1279,8 @@ def submit_cnn_predictions(round_id, model, encoded_grids, initial_states,
                 temperature=temperature)
         else:
             prediction = predict_full_map(model, features, width, height,
-                                          obs_features=obs_feat)
+                                          obs_features=obs_feat,
+                                         raw_observations=seed_obs)
 
         try:
             result = submit_prediction(round_id, seed_idx, prediction)
