@@ -1373,7 +1373,9 @@ def main():
             # Step 7: Predict and resubmit (overwrites the fallback)
             submit_cnn_predictions(
                 round_id, model, encoded_grids, initial_states,
-                seeds_count, width, height
+                seeds_count, width, height,
+                observations=observations,
+                arch=MODEL_ARCH
             )
     except Exception as e:
         print(f"\nERROR in CNN pipeline: {e}")
