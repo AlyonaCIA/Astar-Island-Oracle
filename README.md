@@ -37,7 +37,6 @@ Our toolkit for the **Astar Island** ML challenge — a Norse civilisation simul
   - [Data Sources](#data-sources)
   - [Training Procedure](#training-procedure)
   - [Evaluation Pipeline](#evaluation-pipeline--eval_cnnpy)
-  - [Post-Processing Steps](#post-processing-steps)
   - [Production Submission Pipeline](#production-submission-pipeline--cronpy--astar_cnnpy)
 
 ---
@@ -85,9 +84,7 @@ The full solution lifecycle — from collecting training data through to submitt
                         │  4. Load checkpoint → predict → submit    │
                         │     ├─ Encode terrain + observations      │
                         │     ├─ MiniUNet forward pass              │
-                        │     ├─ Bayesian blend (uncertain pixels)  │
-                        │     ├─ Mountain override (deterministic)  │
-                        │     └─ Submit H×W×6 per seed via API      │
+                        │     └─ Submit raw H×W×6 per seed via API  │
                         │  5. Wait for ground truth availability    │
                         │  6. Retrain (+2,000 epochs from checkpoint)│
                         └───────────────────────────────────────────┘
@@ -116,24 +113,8 @@ What happens when we submit predictions for a live round:
   │  API calls       │     │ → 7 channels:   │     │                  │
   │  (9 tiles × 5    │     │   6 class freq.  │     └────────┬─────────┘
   │   seeds + 5      │     │   1 coverage     │              │
-  │   resample)      │     │                  │              ▼
-  └──────────────────┘     └──────────────────┘     ┌──────────────────┐
-                                                    │ POST-PROCESSING  │
-                                                    │                  │
-                                                    │ 1. Prob floor    │
-                                                    │    (min 0.01)    │
-                                                    │    + renormalize │
-                                                    │                  │
-                                                    │ 2. Bayesian blend│
-                                                    │    CNN + obs     │
-                                                    │    counts where  │
-                                                    │    entropy > 0.54│
-                                                    │                  │
-                                                    │ 3. Mountain      │
-                                                    │    override      │
-                                                    │    (terrain=5 →  │
-                                                    │     95% class 5) │
-                                                    └────────┬─────────┘
+  │   resample)      │     │                  │              │
+  └──────────────────┘     └──────────────────┘              │
                                                              │
                                                              ▼
                                                     ┌──────────────────┐
@@ -407,7 +388,7 @@ This contrasts with the `quick` baseline (a terrain-only CNN with 14 input chann
 - Channels 14–19: observed class frequency per pixel (from viewport queries)
 - Channel 20: coverage indicator — `log(1 + observation_count)`
 
-**Output:** 6-class probability distribution per pixel (softmax, floored at 0.01)
+**Output:** 6-class probability distribution per pixel (softmax, floored at 1e-6 internally)
 
 **Architecture:** MiniUNet (~472K params) with 2 encoder levels + bottleneck + 2 decoder levels:
 
@@ -624,7 +605,7 @@ Astar-Island-Oracle/
 
 ## Solution Architecture — Deep Dive
 
-This section provides a comprehensive explanation of the neural network design, data pipeline, training procedure, evaluation methodology, post-processing steps, and production submission flow.
+This section provides a comprehensive explanation of the neural network design, data pipeline, training procedure, evaluation methodology, and production submission flow.
 
 ### Network Architecture: MiniUNet
 
@@ -687,7 +668,7 @@ Input (21, 40, 40)
 │  Output Head             │
 │  Conv2d(32→6, 1×1)       │
 │  Softmax(dim=1)          │
-│  Clamp(min=0.01)         │
+│  Clamp(min=1e-6)         │
 │  Renormalize             │
 │   → (6, 40, 40)          │
 └──────────────────────────┘
@@ -697,7 +678,7 @@ Input (21, 40, 40)
 - **2 encoder levels** (40→20→10) suffice for a 40×40 map — deeper would over-compress
 - **Skip connections** preserve spatial detail from encoder to decoder, critical for pixel-level prediction
 - **Dropout2d(0.1)** at every block for regularization (small dataset)
-- **Probability floor** (`PROB_FLOOR = 0.01`) is enforced inside the model's `forward()` pass — the output is always a proper probability distribution with no zeros
+- **Probability floor** (`PROB_FLOOR = 1e-6`) is enforced inside the model's `forward()` pass — the output is always a proper probability distribution with no zeros
 - **All 3×3 convolutions** use `padding=1` to preserve spatial dimensions; reflective padding handles odd dimensions
 
 ### Input Encoding: 21 Channels
@@ -791,43 +772,12 @@ When you run `python eval_cnn.py --arch unet_cond --viewports`, the following ha
 2. encode_initial_grid(initial_grid)           → (14, H, W) terrain features
 3. encode_obs_channels(seed_observations)       → (7, H, W)  obs features
 4. Concatenate → (21, H, W) input tensor
-5. Model forward pass                          → (6, H, W)  raw probabilities
-6. Floor at PROB_FLOOR (0.01), renormalize     → cnn_pred (H, W, 6)
-7. Bayesian blend with observations            → blend_pred (H, W, 6)
-8. Mountain override (initial_grid == 5)       → final prediction
-9. competition_score(prediction, ground_truth) → score
+5. Model forward pass                          → (6, H, W)  probabilities
+   └─ softmax → clamp(min=1e-6) → renormalize (inside model)
+6. competition_score(prediction, ground_truth) → score
 ```
 
-### Post-Processing Steps
-
-These are applied **after** the model's forward pass, both in evaluation and in production submission:
-
-#### 1. Bayesian Blend — `bayesian_blend()`
-
-A post-hoc correction for observed pixels where the model remains uncertain despite having seen observations in its input channels.
-
-**When it activates:** Only on pixels that are (a) observed by at least one viewport AND (b) where the CNN output entropy exceeds $0.3 \times \ln(6) \approx 0.54$ nats.
-
-**How it works:**
-
-$$\text{posterior}(c) \propto \underbrace{5.0 \times p_\text{CNN}(c)}_{\text{CNN prior (strength=5)}} + \underbrace{n_\text{obs}(c)}_{\text{empirical count}}$$
-
-where $n_\text{obs}(c)$ is the number of times class $c$ was observed at that pixel across all viewport queries.
-
-**Why it helps:** The model receives observations as input channels but may not fully exploit them for every pixel. The Bayesian blend acts as a cheap insurance layer — if the model is already confident (low entropy), the blend is skipped entirely. If the model is uncertain, empirical observation counts nudge the prediction toward what was actually observed.
-
-**Effect on unobserved pixels:** None — predictions are returned unchanged.
-
-#### 2. Mountain Override
-
-Mountains are **static terrain** — they never change during the simulation. The ground truth for mountain pixels is always $[0, 0, 0, 0, 0, 1.0]$. After all other processing, mountain pixels are hard-set:
-
-```python
-prediction[y, x, :] = PROB_FLOOR           # 0.01 for all classes
-prediction[y, x, 5] = 1.0 - (PROB_FLOOR * 5)  # 0.95 for mountain
-```
-
-This eliminates any residual model error on these deterministic pixels.
+The raw model output is scored directly — no post-processing is applied.
 
 ### Production Submission Pipeline — `cron.py` → `astar_cnn.py`
 
@@ -840,12 +790,10 @@ The automated pipeline runs every 20 minutes. For the prediction submission phas
    b. encode_obs_channels(seed_observations)          → (7, H, W)
    c. predict_full_map(model, features, obs_features) → (H, W, 6)
       ├── Concatenate features → (21, H, W)
-      ├── Model forward pass → softmax → floor → normalize
+      ├── Model forward pass → softmax → clamp(1e-6) → renormalize
       └── Return (H, W, 6) probabilities
-   d. bayesian_blend(prediction, seed_obs, ...)       → (H, W, 6)
-   e. Mountain override (initial_grid == 5)           → (H, W, 6)
-   f. submit_prediction(round_id, seed_idx, prediction) → API call
+   d. submit_prediction(round_id, seed_idx, prediction) → API call
 ```
 
-**This is identical to the eval_cnn.py pipeline** — the same model, same encoding, same post-processing steps in the same order. Scores from `eval_cnn.py` are representative of what gets submitted in production.
+The raw model output is submitted directly — no post-processing (no Bayesian blend, no mountain override, no external probability floor). This is identical to the `eval_cnn.py` pipeline.
 
