@@ -38,7 +38,7 @@ import train_cnn
 # ---------------------------------------------------------------------------
 
 ARCH = "unet_cond"                      # MiniUNet with multi-replay conditioned observation channels
-POLL_INTERVAL_S = 20 * 60              # 20 minutes between checks
+POLL_INTERVAL_S = 10 * 60              # 10 minutes between checks
 GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
 ADDITIONAL_EPOCHS = 2_000              # additional epochs per training cycle
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -340,10 +340,14 @@ def main():
                 )
                 time.sleep(GT_WAIT_S)
                 retrain()
-            elif first_cycle:
-                # First run: always retrain with existing data
-                log.info("First cycle — continuing training with all "
-                         "available ground truth...")
+            else:
+                # No new round to process — use idle time to keep training
+                if first_cycle:
+                    log.info("First cycle — continuing training with all "
+                             "available ground truth...")
+                else:
+                    log.info("No new round to process — training "
+                             f"+{ADDITIONAL_EPOCHS} epochs while waiting...")
                 retrain()
 
             first_cycle = False

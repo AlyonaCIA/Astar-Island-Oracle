@@ -59,7 +59,7 @@ API_TIMEOUT = 30
 def fetch_rounds():
     resp = session.get(f"{BASE_URL}/rounds", timeout=API_TIMEOUT)
     resp.raise_for_status()
-    time.sleep(random.uniform(6, 9))
+    time.sleep(random.uniform(7, 10))
     return resp.json()
 
 
@@ -70,7 +70,7 @@ def fetch_replay(round_id, seed_index):
         timeout=API_TIMEOUT,
     )
     resp.raise_for_status()
-    time.sleep(random.uniform(6, 9))
+    time.sleep(random.uniform(7, 10))
     return resp.json()
 
 

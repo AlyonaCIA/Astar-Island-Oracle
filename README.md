@@ -305,12 +305,11 @@ python cron.py --once   # Single cycle — process one round and exit
 
 What happens each cycle:
 1. Checks for an active round via the API
-2. Submits a prior-based fallback (guarantees a score even if the model fails)
-3. Spends the query budget collecting viewport observations
-4. Loads the latest `unet_cond` checkpoint, runs inference, and submits predictions per seed
-5. After the round closes, waits for ground truth, then retrains (+2,000 epochs from last checkpoint)
+2. If a new round is found: submits a prior-based fallback, collects observations, submits predictions, waits for ground truth
+3. Retrains +2,000 epochs from the last checkpoint (happens every cycle, even when idle between rounds)
+4. Sleeps 10 minutes, then repeats
 
-State is tracked in `cron_state.json` to avoid reprocessing the same round.
+This means the model continuously improves between rounds using all available data. State is tracked in `cron_state.json` to avoid reprocessing the same round.
 
 ### Manual Training
 
@@ -557,11 +556,11 @@ Configuration (in `cron.py`):
 | Setting | Value | Description |
 |---------|-------|-------------|
 | `ARCH` | `unet_cond` | Model architecture |
-| `POLL_INTERVAL_S` | 1200 (20 min) | Check interval |
+| `POLL_INTERVAL_S` | 600 (10 min) | Check interval |
 | `GT_WAIT_S` | 600 (10 min) | Wait for GT before retrain |
 | `ADDITIONAL_EPOCHS` | 2000 | Additional epochs per training cycle |
 
-Retraining resumes from the latest checkpoint (optimizer state, LR schedule preserved) and trains 2,000 additional epochs using `--cv all` (all data, no holdout). The model continuously improves as new data arrives.
+Retraining resumes from the latest checkpoint (optimizer state, LR schedule preserved) and trains 2,000 additional epochs using `--cv all` (all data, no holdout). Training happens every cycle — even when no new round is active — so the model continuously improves between rounds as new replay data becomes available.
 
 ```bash
 python cron.py          # run forever
