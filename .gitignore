@@ -35,6 +35,10 @@ Desktop.ini
 .env
 *.token
 
+# Runtime logs / state
+cron.log
+cron_state.json
+
 # Model weights
 *.pt
 *.pth
