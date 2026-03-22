@@ -21,7 +21,7 @@ Our toolkit for the **Astar Island** ML challenge — a Norse civilisation simul
 - [Production Pipeline](#production-pipeline)
   - [What is unet\_cond?](#what-is-unet_cond)
   - [Architecture — unet\_cond](#architecture--unet_cond)
-  - [Viewport Strategy — Coverage First](#viewport-strategy--coverage-first)
+  - [Viewport Strategy — Settlement-Focused](#viewport-strategy--settlement-focused)
   - [Observation Encoding](#observation-encoding)
   - [Training — Offline with Multi-Replay Data](#training--offline-with-multi-replay-data)
   - [Cross-Validation](#cross-validation)
@@ -62,7 +62,7 @@ The full solution lifecycle — from collecting training data through to submitt
                         │  train_cnn.py --model unet_cond --cv all  │
                         │    └─ Build training set:                 │
                         │       ├─ 14ch terrain + 7ch observations  │
-                        │       ├─ Multi-replay obs synthesis       │
+                        │       ├─ Settlement-focused obs synthesis │
                         │       └─ Obs dropout augmentation         │
                         │    └─ Train MiniUNet (~472K params)       │
                         │       └─ checkpoints_unet_cond/           │
@@ -73,20 +73,19 @@ The full solution lifecycle — from collecting training data through to submitt
                         └───────────────┬───────────────────────────┘
                                         │
                         ┌───────────────▼───────────────────────────┐
-                        │     PRODUCTION (every 20 min via cron.py) │
+                        │    PRODUCTION (every 30 min via cron.py)  │
                         │                                           │
                         │  1. Detect active round (API)             │
                         │  2. Submit prior-based fallback           │
                         │     └─ Guarantees a score immediately     │
                         │  3. Collect observations (50 queries)     │
-                        │     ├─ Phase 1: 45 queries → full map     │
-                        │     └─ Phase 2: 5 queries → resample      │
+                        │     ├─ Phase 1: settlement-focused cover  │
+                        │     └─ Phase 2: multi-observe dynamic VPs │
                         │  4. Load checkpoint → predict → submit    │
                         │     ├─ Encode terrain + observations      │
                         │     ├─ MiniUNet forward pass              │
                         │     └─ Submit raw H×W×6 per seed via API  │
-                        │  5. Wait for ground truth availability    │
-                        │  6. Retrain (+2,000 epochs from checkpoint)│
+                        │  5. Sleep 30 min, repeat                  │
                         └───────────────────────────────────────────┘
 ```
 
@@ -111,9 +110,9 @@ What happens when we submit predictions for a live round:
   │                  │     │ encode_obs       │  │  │  → 6ch output    │
   │ 50 simulate()   ├────►│   _channels()    ├──┘  │  (softmax probs) │
   │  API calls       │     │ → 7 channels:   │     │                  │
-  │  (9 tiles × 5    │     │   6 class freq.  │     └────────┬─────────┘
-  │   seeds + 5      │     │   1 coverage     │              │
-  │   resample)      │     │                  │              │
+  │  (settlement     │     │   6 class freq.  │     └────────┬─────────┘
+  │   cover + multi  │     │   1 coverage     │              │
+  │   observe)       │     │                  │              │
   └──────────────────┘     └──────────────────┘              │
                                                              │
                                                              ▼
@@ -135,42 +134,37 @@ What happens when we submit predictions for a live round:
 ```
   Budget: 50 queries total, shared across 5 seeds
 
-  Phase 1 — FULL COVERAGE (45 queries = 9 tiles × 5 seeds)
+  Phase 1 — SETTLEMENT COVERAGE (variable queries)
   ┌─────────────────────────────────────────────────────┐
   │                                                     │
-  │  Systematic 3×3 tile grid on the 40×40 map:         │
+  │  Greedy set-cover: place 15×15 viewports to capture │
+  │  ALL settlements and ports on every seed.            │
   │                                                     │
-  │       x=0       x=12      x=25                      │
-  │  y=0  ┌─────────┬─────────┬─────────┐              │
-  │       │ A 15×15 │ B 15×15 │ C 15×15 │              │
-  │  y=12 ├─────────┼─────────┼─────────┤              │
-  │       │ D 15×15 │ E 15×15 │ F 15×15 │              │
-  │  y=25 ├─────────┼─────────┼─────────┤              │
-  │       │ G 15×15 │ H 15×15 │ I 15×15 │              │
-  │       └─────────┴─────────┴─────────┘              │
+  │  1. Identify settlement/port cells on each seed     │
+  │  2. Greedy placement: pick the 15×15 viewport that  │
+  │     covers the most uncovered settlements, repeat   │
+  │  3. Sort viewports by settlement density (most      │
+  │     settlements first → queried first)              │
+  │  4. Round-robin across seeds: viewport 0 on all     │
+  │     seeds, then viewport 1, etc.                    │
   │                                                     │
-  │  → 100% pixel coverage                              │
-  │  → 375 cells (23%) observed 2× from natural overlap │
-  │                                                     │
-  │  Priority: tiles scored by terrain dynamism          │
-  │    Settlement: +5 | Port: +6 | Forest: +0.3         │
-  │    Plains/Empty: +0.5 | Ocean/Mountain: 0           │
-  │    + coastal bonus + cluster bonus                   │
-  │                                                     │
-  │  First tile per seed = "scout" →                     │
-  │    cross-seed dynamism re-ranks remaining tiles      │
+  │  → 100% settlement/port coverage                    │
+  │  → Number of viewports adapts per map layout        │
+  │  → Falls back to center viewport if no settlements  │
   └─────────────────────────────────────────────────────┘
 
-  Phase 2 — SMART RESAMPLE (5 remaining queries)
+  Phase 2 — MULTI-OBSERVE (remaining budget)
   ┌─────────────────────────────────────────────────────┐
-  │  Re-query most dynamic viewports across all seeds:  │
-  │  1. Rank viewports by change_rate                   │
-  │     (fraction of cells differing from initial)      │
-  │  2. Include cross-seed targets for under-sampled    │
-  │  3. Round-robin through top candidates              │
+  │  Re-query most dynamic settlement viewports:        │
+  │  1. Build cross-seed dynamism heatmap from Phase 1  │
+  │     (per-cell change rate vs initial terrain)        │
+  │  2. Rank all settlement viewports by:               │
+  │     terrain score (score_tile) + 2× dynamism bonus  │
+  │  3. Cycle through top candidates round-robin        │
   │                                                     │
   │  Each re-query = independent stochastic simulation  │
   │  → genuinely new sample, not redundant data         │
+  │  → builds richer empirical frequency distributions  │
   └─────────────────────────────────────────────────────┘
 ```
 
@@ -186,7 +180,7 @@ A 40×40 procedurally generated map runs a Norse simulation for 50 years: settle
 
 | File | Purpose |
 |------|---------|
-| `cron.py` | **Production pipeline** — automated 20-min cycle: submit fallback → query viewports → submit CNN predictions → retrain |
+| `cron.py` | **Production pipeline** — automated 30-min cycle: submit fallback → query viewports → submit CNN predictions |
 | `astar_cnn.py` | Live inference: viewport strategy, observation encoding, model loading, prediction submission |
 | `train_cnn.py` | Offline training with ground truth + simulation replay data |
 | `eval_cnn.py` | Evaluate checkpoints against competition metric |
@@ -259,12 +253,12 @@ python train_cnn.py --model unet_cond
 python train_cnn.py --model unet_cond --cv round_kfold
 ```
 
-Checkpoints are saved to `checkpoints_unet_cond/` every 25 epochs.
+Checkpoints are saved to `checkpoints_unet_cond/` every 1000 epochs.
 
 ### Run the Automated Pipeline
 
 ```bash
-# Run continuously (checks every 20 minutes)
+# Run continuously (checks every 30 minutes)
 python cron.py
 
 # Single cycle (for testing)
@@ -280,17 +274,16 @@ python cron.py --once
 The recommended way to participate in live rounds:
 
 ```bash
-python cron.py          # Run forever — checks every 20 min
+python cron.py          # Run forever — checks every 30 min
 python cron.py --once   # Single cycle — process one round and exit
 ```
 
 What happens each cycle:
 1. Checks for an active round via the API
-2. If a new round is found: submits a prior-based fallback, collects observations, submits predictions, waits for ground truth
-3. Retrains +2,000 epochs from the last checkpoint (happens every cycle, even when idle between rounds)
-4. Sleeps 10 minutes, then repeats
+2. If a new round is found: submits a prior-based fallback, collects observations, submits CNN predictions
+3. Sleeps 30 minutes, then repeats
 
-This means the model continuously improves between rounds using all available data. State is tracked in `cron_state.json` to avoid reprocessing the same round.
+State is tracked in `cron_state.json` to avoid reprocessing the same round. Retraining is done manually via `train_cnn.py`.
 
 ### Manual Training
 
@@ -404,35 +397,30 @@ This contrasts with the `quick` baseline (a terrain-only CNN with 14 input chann
 
 All convolutions are 3×3 with `padding=1`. Dropout2d(0.1) at every block. Transpose convolutions for upsampling. Skip connections concatenate encoder features to decoder features.
 
-### Viewport Strategy — Coverage First
+### Viewport Strategy — Settlement-Focused
 
-The query strategy guarantees **100% map coverage** before spending any budget on resampling. Implemented in `astar_cnn.py :: collect_observations()`.
+The query strategy guarantees **100% settlement/port coverage** before spending any budget on multi-observation. Implemented in `astar_cnn.py :: collect_observations()`.
 
-#### Phase 1 — Full Coverage (45 queries)
+#### Phase 1 — Settlement Coverage (variable queries)
 
-Uses systematic tile grid: 9 tiles of 15×15 covering the entire 40×40 map.
+Uses greedy set-cover to place 15×15 viewports that capture ALL settlements and ports on the initial grid:
 
-```
-Tile positions (3×3 grid):
-      x=0       x=12      x=25
-y=0   [A 15×15  ][B 15×15  ][C 15×15  ]
-y=12  [D 15×15  ][E 15×15  ][F 15×15  ]
-y=25  [G 15×15  ][H 15×15  ][I 15×15  ]
+1. Identify all settlement (1) and port (2) cells
+2. Greedily pick the 15×15 viewport covering the most uncovered settlements
+3. Repeat until all settlements are covered
+4. Sort viewports by settlement density (most settlements first)
+5. Query round-robin across seeds: viewport 0 on all seeds, then viewport 1, etc.
 
-→ 100% coverage, 375 cells (23%) observed 2× from natural overlap
-→ 9 tiles × 5 seeds = 45 queries
-```
+The number of viewports adapts per map — maps with scattered settlements need more viewports than tightly clustered ones. Falls back to a center viewport if no settlements exist.
 
-**Priority ordering:** Tiles are scored by terrain dynamism (`score_tile`) — settlements and ports first, ocean/mountain last. The first tile per seed acts as a "scout" — after all 5 scouts complete, cross-seed dynamism intelligence re-ranks remaining tiles so high-activity areas are observed sooner.
+#### Phase 2 — Multi-Observe (remaining budget)
 
-#### Phase 2 — Smart Resample (5 remaining queries)
+Remaining budget re-queries the most dynamic settlement viewports across all seeds:
+1. Build a cross-seed dynamism heatmap from Phase 1 observations (per-cell change rate vs initial terrain)
+2. Rank all settlement viewports by `score_tile` terrain score + 2× observed dynamism bonus
+3. Cycle through top candidates round-robin
 
-Remaining budget re-queries the most dynamic viewports across all seeds:
-1. Rank observed viewports by `change_rate` (fraction of cells that differ from initial terrain)
-2. Include cross-seed-informed targets for under-sampled seeds
-3. Round-robin through top candidates
-
-Since each query runs an independent stochastic simulation, re-querying a viewport provides a genuinely new sample — improving the empirical distribution estimate for that region.
+Since each query runs an independent stochastic simulation, re-querying a viewport provides a genuinely new sample — building richer empirical frequency distributions that the model leverages for better predictions.
 
 ### Observation Encoding
 
@@ -456,9 +444,10 @@ Multiple observations of the same cell (from overlapping tiles or resample queri
 In production, each viewport query triggers an independent stochastic simulation — so different viewports observe different random outcomes even on the same seed. The training pipeline replicates this:
 
 1. Loads all available replay grids (final frames) for the round
-2. Places viewports using the same systematic 3×3 tile grid as production
-3. For each tile, randomly selects one of the available replay grids — so overlapping tiles may show different stochastic outcomes, just like production
-4. Encodes the result as 7 observation channels (6 class frequencies + coverage)
+2. Places viewports using the same settlement-focused greedy set-cover as production
+3. Phase 1: all settlement viewports once; Phase 2: cycles through viewports ranked by terrain score to fill the per-seed budget
+4. For each viewport, randomly selects one of the available replay grids — so different viewports may show different stochastic outcomes, just like production
+5. Encodes the result as 7 observation channels (6 class frequencies + coverage)
 
 For each ground truth sample:
 - **3 copies** with different random multi-replay observation patterns
@@ -521,15 +510,14 @@ When training with `--cv all` (production), neither applies since there is no va
 
 ### Automated Pipeline — cron.py
 
-Runs every 20 minutes in a continuous loop:
+Runs every 30 minutes in a continuous loop:
 
 ```
 ┌─ Check for active round
 ├─ Submit prior-based fallback (guarantees a score)
-├─ Collect observations (2-phase viewport strategy)
+├─ Collect observations (settlement-focused 2-phase strategy)
 ├─ Load pretrained checkpoint → submit CNN predictions
-├─ Wait 10 min for ground truth availability
-└─ Retrain (+2,000 epochs from latest checkpoint)
+└─ Sleep 30 min, repeat
 ```
 
 Configuration (in `cron.py`):
@@ -537,11 +525,9 @@ Configuration (in `cron.py`):
 | Setting | Value | Description |
 |---------|-------|-------------|
 | `ARCH` | `unet_cond` | Model architecture |
-| `POLL_INTERVAL_S` | 600 (10 min) | Check interval |
-| `GT_WAIT_S` | 600 (10 min) | Wait for GT before retrain |
-| `ADDITIONAL_EPOCHS` | 2000 | Additional epochs per training cycle |
+| `POLL_INTERVAL_S` | 1800 (30 min) | Sleep between cycles |
 
-Retraining resumes from the latest checkpoint (optimizer state, LR schedule preserved) and trains 2,000 additional epochs using `--cv all` (all data, no holdout). Training happens every cycle — even when no new round is active — so the model continuously improves between rounds as new replay data becomes available.
+Retraining is done manually via `train_cnn.py` (e.g., `python train_cnn.py --model unet_cond --forever`). The cron pipeline focuses on observation collection and submission.
 
 ```bash
 python cron.py          # run forever
@@ -566,7 +552,7 @@ From analysis across rounds of observation data:
 
 ```
 Astar-Island-Oracle/
-├── cron.py                  # Production pipeline (automated 20-min cycle)
+├── cron.py                  # Production pipeline (automated 30-min cycle)
 ├── astar_cnn.py             # Live inference + viewport strategy + submission
 ├── train_cnn.py             # Offline training (ground truth + replays)
 ├── eval_cnn.py              # Checkpoint evaluation against competition metric
@@ -586,7 +572,7 @@ Astar-Island-Oracle/
 │   └── round_*.json         # Cached round metadata
 ├── replays/                 # Replay files: r{N}_s{M}_*.json (51 frames each)
 ├── checkpoints_unet_cond/   # unet_cond checkpoints (production)
-│   ├── cnn_epoch_XXXX.pt    # Checkpoint every 25 epochs
+│   ├── cnn_epoch_XXXX.pt    # Checkpoint every 1000 epochs
 │   ├── cnn_latest.pt        # Latest checkpoint (used by cron.py)
 │   └── training_history.json
 └── checkpoints/             # QuickCNN checkpoints (baseline)
@@ -598,7 +584,7 @@ Astar-Island-Oracle/
 
 | Architecture | Input Channels | Params | Description | CV Default | Loss |
 |---|---|---|---|---|---|
-| `unet_cond` | 21 (14 terrain + 7 obs) | ~472K | **Production.** MiniUNet conditioned on stochastic viewport observations. Multi-replay obs synthesis, entropy-weighted KL, observation dropout | `all` | entropy-weighted KL |
+| `unet_cond` | 21 (14 terrain + 7 obs) | ~472K | **Production.** MiniUNet conditioned on stochastic viewport observations. Settlement-focused obs synthesis, entropy-weighted KL, observation dropout | `all` | entropy-weighted KL |
 | `quick` | 14 | ~14K | QuickCNN (2-layer, terrain-only baseline) | `quadrant` | KL divergence |
 
 ---
@@ -721,7 +707,7 @@ Multiple viewport queries of the same pixel produce genuine frequency distributi
 #### Production Data (Live Rounds)
 
 - `initial_grid` from the API for the current round
-- Viewport observations collected during the 20-minute window via `collect_observations()`
+- Viewport observations collected during the round window via `collect_observations()`
 
 ### Training Procedure
 
@@ -731,9 +717,10 @@ The critical training challenge: in production, each viewport query runs an inde
 
 `sample_multi_replay_obs_channels()` simulates production-like observation patterns:
 
-1. Places viewports on a systematic 3×3 tile grid (same as production)
-2. **For each viewport, randomly selects one of the available replay grids** — so overlapping tiles may show different outcomes, just like production
-3. Encodes the result as 7 observation channels
+1. Places viewports using settlement-focused greedy set-cover (same algorithm as production)
+2. Phase 1: all settlement viewports once; Phase 2: fills remaining per-seed budget by cycling through viewports ranked by terrain score
+3. **For each viewport, randomly selects one of the available replay grids** — so different viewports may show different stochastic outcomes, just like production
+4. Encodes the result as 7 observation channels
 
 For each ground truth sample, training generates:
 - **3 copies** with different random multi-replay observation patterns
@@ -781,7 +768,7 @@ The raw model output is scored directly — no post-processing is applied.
 
 ### Production Submission Pipeline — `cron.py` → `astar_cnn.py`
 
-The automated pipeline runs every 20 minutes. For the prediction submission phase:
+The automated pipeline runs every 30 minutes. For the prediction submission phase:
 
 ```
 1. Load latest checkpoint from checkpoints_unet_cond/
