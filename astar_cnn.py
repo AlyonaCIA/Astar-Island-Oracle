@@ -924,7 +924,7 @@ def predict_full_map(model, features, width, height, obs_features=None):
             x = features
         x = torch.tensor(x).unsqueeze(0).to(DEVICE)
 
-        probs = model(x)  # temperature=1.0 (default)
+        probs = model(x, temperature=0.85)
         probs = probs.squeeze(0)
         probs = probs.permute(1, 2, 0).cpu().numpy()
 
