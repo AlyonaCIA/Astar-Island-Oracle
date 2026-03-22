@@ -599,6 +599,64 @@ def _compute_tile_grid(width, height, max_tile=15):
     return [(tx, ty, tw, th) for (ty, th) in y_specs for (tx, tw) in x_specs]
 
 
+def _compute_settlement_viewports(initial_grid, width, height, max_tile=15):
+    """
+    Greedy set-cover: place max_tile × max_tile viewports to capture ALL
+    settlements (1) and ports (2) on the initial grid.
+    Returns viewports sorted by settlement density (most settlements first).
+    Falls back to a single center viewport if no settlements exist.
+    """
+    settlements = []
+    for y in range(height):
+        for x in range(width):
+            if initial_grid[y][x] in (1, 2):
+                settlements.append((y, x))
+
+    tw = min(max_tile, width)
+    th = min(max_tile, height)
+
+    if not settlements:
+        cx = max(0, (width - tw) // 2)
+        cy = max(0, (height - th) // 2)
+        return [(cx, cy, tw, th)]
+
+    max_x = max(0, width - tw)
+    max_y = max(0, height - th)
+
+    uncovered = set(range(len(settlements)))
+    viewports = []
+
+    while uncovered:
+        best_vp = None
+        best_count = 0
+
+        for vy in range(max_y + 1):
+            for vx in range(max_x + 1):
+                count = sum(1 for i in uncovered
+                            if vy <= settlements[i][0] < vy + th
+                            and vx <= settlements[i][1] < vx + tw)
+                if count > best_count:
+                    best_count = count
+                    best_vp = (vx, vy, tw, th)
+
+        if best_vp is None or best_count == 0:
+            break
+
+        viewports.append(best_vp)
+        vx, vy, vw, vh = best_vp
+        uncovered = {i for i in uncovered
+                     if not (vy <= settlements[i][0] < vy + vh
+                             and vx <= settlements[i][1] < vx + vw)}
+
+    def _count_settlements(vp):
+        vx, vy, vw, vh = vp
+        return sum(1 for sy, sx in settlements
+                   if vy <= sy < vy + vh and vx <= sx < vx + vw)
+
+    viewports.sort(key=_count_settlements, reverse=True)
+    return viewports
+
+
 def _load_all_replays_by_round():
     """
     Load all replay final grids grouped by round.
@@ -626,23 +684,70 @@ def _load_all_replays_by_round():
     return by_round
 
 
-def sample_multi_replay_obs_channels(round_replays, width, height, vp_size=15):
+def _score_tile(initial_grid, tile, width, height):
     """
-    Sample viewports from MULTIPLE replay grids to simulate production
-    stochastic observation behavior.
+    Score a tile's priority based on initial terrain content.
+    Matches production score_tile() in astar_cnn.py exactly.
+    """
+    tx, ty, tw, th = tile
+    score = 0.0
+    n_settlements = 0
 
-    In production each viewport query triggers an independent simulation,
-    so different viewports observe different stochastic outcomes. We simulate
-    this by selecting a random replay grid for each viewport.
+    for dy in range(th):
+        for dx in range(tw):
+            y, x = ty + dy, tx + dx
+            if 0 <= y < height and 0 <= x < width:
+                cell = initial_grid[y][x]
+                if cell == 1:
+                    score += 5.0
+                    n_settlements += 1
+                elif cell == 2:
+                    score += 6.0
+                    n_settlements += 1
+                elif cell == 4:
+                    score += 0.3
+                elif cell in (0, 11):
+                    score += 0.5
 
-    When viewports overlap, the same pixel may be observed from different
-    replays, creating genuine multi-sample frequency distributions (e.g.,
-    0.6/0.2/0.1/0.1) instead of binary 0/1 values from a single replay.
+    for dy in range(th):
+        for dx in range(tw):
+            y, x = ty + dy, tx + dx
+            if 0 <= y < height and 0 <= x < width:
+                cell = initial_grid[y][x]
+                if cell not in (10, 5):
+                    for ny, nx in [(y-1, x), (y+1, x), (y, x-1), (y, x+1)]:
+                        if 0 <= ny < height and 0 <= nx < width:
+                            if initial_grid[ny][nx] == 10:
+                                score += 0.3
+                                break
+
+    if n_settlements >= 2:
+        score += n_settlements * 1.0
+
+    return score
+
+
+def sample_multi_replay_obs_channels(round_replays, width, height,
+                                      initial_grid=None, vp_size=15,
+                                      budget_per_seed=10, seeds_count=5):
+    """
+    Sample settlement-focused viewports from MULTIPLE replay grids to simulate
+    production stochastic observation behavior.
+
+    Matches the production strategy in astar_cnn.py exactly:
+      Phase 1: All settlement viewports (one pass)
+      Phase 2: Remaining budget cycles through viewports ranked by
+               terrain score (matching score_tile), most interesting first.
+
+    Total queries per seed = budget_per_seed (default: 50 budget / 5 seeds = 10).
 
     Args:
         round_replays: list of final_grid arrays (all replays for a round)
         width, height: map dimensions
+        initial_grid: initial terrain grid (enables settlement-focused viewports)
         vp_size: viewport size (default 15)
+        budget_per_seed: queries allocated to this seed (default 10)
+        seeds_count: number of seeds (used to compute budget, default 5)
 
     Returns:
         (7, H, W) observation channels (same format as encode_obs_channels)
@@ -650,18 +755,37 @@ def sample_multi_replay_obs_channels(round_replays, width, height, vp_size=15):
     obs_counts = np.zeros((NUM_CLASSES, height, width), dtype=np.float32)
     obs_hits = np.zeros((height, width), dtype=np.float32)
 
-    available_grids = round_replays
-    if not available_grids:
-        # No replays: return zeros
+    if not round_replays:
         coverage = np.zeros((1, height, width), dtype=np.float32)
         return np.concatenate([obs_counts, coverage], axis=0)
 
-    # Generate systematic tile grid (matches production layout)
-    tiles = _compute_tile_grid(width, height, vp_size)
+    # Settlement-focused viewports if initial_grid available, else systematic grid
+    if initial_grid is not None:
+        viewports = _compute_settlement_viewports(initial_grid, width, height, vp_size)
+    else:
+        viewports = _compute_tile_grid(width, height, vp_size)
 
-    for vx, vy, vw, vh in tiles:
-        # Each viewport samples from a randomly chosen replay grid
-        grid = random.choice(available_grids)
+    if not viewports:
+        coverage = np.zeros((1, height, width), dtype=np.float32)
+        return np.concatenate([obs_counts, coverage], axis=0)
+
+    # Build query plan matching production exactly:
+    # Phase 1: all settlement viewports once (sorted by density — already sorted)
+    # Phase 2: cycle through viewports ranked by score_tile (most interesting first)
+    query_plan = list(viewports)  # Phase 1
+
+    if initial_grid is not None and len(query_plan) < budget_per_seed:
+        # Phase 2: rank by score (matches production score_tile + dynamism ranking)
+        scored = sorted(viewports,
+                        key=lambda vp: _score_tile(initial_grid, vp, width, height),
+                        reverse=True)
+        idx = 0
+        while len(query_plan) < budget_per_seed:
+            query_plan.append(scored[idx % len(scored)])
+            idx += 1
+
+    for vx, vy, vw, vh in query_plan:
+        grid = random.choice(round_replays)
         for dy in range(vh):
             for dx in range(vw):
                 gy, gx = vy + dy, vx + dx
@@ -679,13 +803,17 @@ def sample_multi_replay_obs_channels(round_replays, width, height, vp_size=15):
     return np.concatenate([obs_counts, coverage], axis=0)  # (7, H, W)
 
 
-def build_fullmap_datasets_cond(all_data, copies_per_map=3):
+def build_fullmap_datasets_cond(all_data, copies_per_map=None):
     """
     Build full-map datasets for unet_cond training.
 
     Uses multi-replay observation sampling: each viewport randomly selects
     from the available replay grids for that round, creating realistic
     multi-sample frequency distributions for overlapping regions.
+
+    copies_per_map: number of observation scenarios per ground-truth map.
+        If None (default), uses the number of replays available for each
+        round — maximizing data utilization.
 
     No augmentation (rotation/flip) — observation patterns must match
     production layout.
@@ -702,6 +830,7 @@ def build_fullmap_datasets_cond(all_data, copies_per_map=3):
 
     n_with_replay = 0
     n_without_replay = 0
+    total_obs_copies = 0
 
     for data in all_data:
         initial_grid = data.get("initial_grid")
@@ -722,10 +851,12 @@ def build_fullmap_datasets_cond(all_data, copies_per_map=3):
 
         if round_replays:
             n_with_replay += 1
-            # Create copies with different multi-replay viewport samples
-            for copy_i in range(copies_per_map):
+            # Use all replay data: one observation scenario per available replay
+            n_copies = copies_per_map if copies_per_map is not None else len(round_replays)
+            total_obs_copies += n_copies
+            for copy_i in range(n_copies):
                 obs_feat = sample_multi_replay_obs_channels(
-                    round_replays, width, height)
+                    round_replays, width, height, initial_grid=initial_grid)
                 features = np.concatenate([terrain_feat, obs_feat], axis=0)
 
                 features_list.append(features)
@@ -754,7 +885,7 @@ def build_fullmap_datasets_cond(all_data, copies_per_map=3):
         })
 
     print(f"  Full maps (unet_cond): {len(features_list)} total "
-          f"({n_with_replay} with replay x {copies_per_map} multi-replay copies + "
+          f"({n_with_replay} maps with replays, {total_obs_copies} obs copies + "
           f"{n_with_replay + n_without_replay} zero-obs fallbacks)")
     return features_list, targets_list, meta
 

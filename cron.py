@@ -1,18 +1,14 @@
 """
 Astar Island — Automated Pipeline (Cron)
 
-Runs continuously, checking every 20 minutes for active rounds.
+Runs continuously, checking every 30 minutes for active rounds.
 
 Pipeline per round:
   1. Check for active round + budget
   2. Submit prior-based fallback (guarantees a score)
   3. Query viewports (deterministic/stochastic detection strategy)
-  4. Submit UNet predictions (overwrites fallback)
-  5. Log observations to disk
-  6. Wait 10 minutes for ground truth availability
-  7. Fetch ground truth from completed rounds
-  8. Retrain UNet (2,000 additional epochs from last checkpoint)
-  9. Sleep 20 minutes, repeat
+  4. Submit UNet predictions (overwrites fallback) using last checkpoint
+  5. Sleep 30 minutes, repeat
 
 Usage:
     python cron.py              # run forever
@@ -27,20 +23,16 @@ import datetime
 import logging
 import traceback
 
-import torch
-
 # Import project modules (they auto-load .env and configure API sessions)
 import astar_cnn
-import train_cnn
+import train_cnn  # used for checkpoint loading utilities
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 ARCH = "unet_cond"                      # MiniUNet with multi-replay conditioned observation channels
-POLL_INTERVAL_S = 10 * 60              # 10 minutes between checks
-GT_WAIT_S = 10 * 60                    # 10 minutes wait for ground truth
-ADDITIONAL_EPOCHS = 2_000              # additional epochs per training cycle
+POLL_INTERVAL_S = 30 * 60              # 30 minutes between checks
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "cron_state.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "cron.log")
@@ -116,16 +108,6 @@ def load_unet_model():
     return model, ckpt.get("epoch", 0)
 
 
-def get_current_epoch():
-    """Return the epoch number of the latest UNet checkpoint, or 0."""
-    ckpt_dir = train_cnn.get_checkpoint_dir(ARCH)
-    ckpt_path = train_cnn.latest_checkpoint(ckpt_dir)
-    if not ckpt_path:
-        return 0
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    return ckpt.get("epoch", 0)
-
-
 # ---------------------------------------------------------------------------
 # Pipeline: check active round → query → submit
 # ---------------------------------------------------------------------------
@@ -151,14 +133,13 @@ def run_pipeline():
     log.info(f"Active round #{round_num} ({round_key}…)")
     log.info(f"  Closes at: {active.get('closes_at', 'unknown')}")
 
-    # --- 2. Already processed? ---
+    # --- 2. Previously submitted? (resubmit anyway) ---
     if round_key in state["processed_rounds"]:
         prev = state["processed_rounds"][round_key]
         log.info(
-            f"Round #{round_num} already processed "
-            f"at {prev.get('processed_at', '?')}. Skipping."
+            f"Round #{round_num} previously submitted "
+            f"at {prev.get('processed_at', '?')}. Resubmitting..."
         )
-        return False
 
     # --- 3. Check budget ---
     budget = get_budget_safe()
@@ -199,7 +180,7 @@ def run_pipeline():
     # --- 6. Collect observations if budget available ---
     observations = []
     if has_budget:
-        log.info("--- Collecting observations (stochastic strategy) ---")
+        log.info("--- Collecting observations (settlement-focused strategy) ---")
         try:
             observations = astar_cnn.collect_observations(
                 round_id, seeds_count, initial_states, width, height
@@ -239,7 +220,7 @@ def run_pipeline():
             f"{train_cnn.get_checkpoint_dir(ARCH)}. Fallback stands."
         )
 
-    # --- 8. Mark as processed ---
+    # --- 8. Log submission ---
     state["processed_rounds"][round_key] = {
         "round_number": round_num,
         "round_id": round_id,
@@ -249,52 +230,8 @@ def run_pipeline():
         "status": "submitted",
     }
     save_state(state)
-    log.info(f"Round #{round_num} marked as processed.\n")
+    log.info(f"Round #{round_num} submission logged.\n")
     return True
-
-
-# ---------------------------------------------------------------------------
-# Retrain: fetch ground truth → train up to MAX_TRAIN_EPOCHS new epochs
-# ---------------------------------------------------------------------------
-
-
-def retrain():
-    """Fetch the latest ground truth and continue training the UNet from the last checkpoint."""
-
-    # 1. Fetch / refresh ground truth (all rounds, all seeds)
-    log.info("--- Fetching ground truth from API ---")
-    try:
-        all_data = train_cnn.fetch_ground_truth()
-    except Exception as e:
-        log.error(f"Ground truth fetch failed: {e}")
-        log.info("Falling back to locally cached ground truth...")
-        all_data = train_cnn.load_local_data()
-
-    if not all_data:
-        log.warning("No training data available. Skipping retraining.")
-        return
-
-    current_epoch = get_current_epoch()
-    target_epoch = current_epoch + ADDITIONAL_EPOCHS
-    log.info(f"Training data: {len(all_data)} samples (all rounds/seeds)")
-    log.info(f"Resuming from epoch {current_epoch}, training to epoch {target_epoch} (+{ADDITIONAL_EPOCHS})")
-
-    # 2. Resume training with all data
-    original_epochs = train_cnn.EPOCHS
-    train_cnn.EPOCHS = target_epoch
-
-    try:
-        train_cnn.train(all_data, reset=False, forever=False, arch=ARCH, cv="all")
-    except KeyboardInterrupt:
-        raise  # propagate to outer loop
-    except Exception as e:
-        log.error(f"Training error: {e}")
-        log.error(traceback.format_exc())
-    finally:
-        train_cnn.EPOCHS = original_epochs
-
-    final_epoch = get_current_epoch()
-    log.info(f"Retraining complete. Final epoch: {final_epoch}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +248,6 @@ def main():
     log.info(f"  Architecture:  {ARCH}")
     log.info(f"  Device:        {astar_cnn.DEVICE}")
     log.info(f"  Poll interval: {POLL_INTERVAL_S // 60} min")
-    log.info(f"  GT wait:       {GT_WAIT_S // 60} min")
-    log.info(f"  Additional epochs/cycle: {ADDITIONAL_EPOCHS}")
     log.info(f"  Log file:      {LOG_FILE}")
     log.info(f"  State file:    {STATE_FILE}")
 
@@ -326,32 +261,9 @@ def main():
         log.info("  Mode:          --once (single cycle)")
     log.info("")
 
-    first_cycle = True
-
     while True:
         try:
-            submitted = run_pipeline()
-
-            if submitted:
-                # Wait for ground truth to become available
-                log.info(
-                    f"Waiting {GT_WAIT_S // 60} minutes for ground truth "
-                    f"before retraining..."
-                )
-                time.sleep(GT_WAIT_S)
-                retrain()
-            else:
-                # No new round to process — use idle time to keep training
-                if first_cycle:
-                    log.info("First cycle — continuing training with all "
-                             "available ground truth...")
-                else:
-                    log.info("No new round to process — training "
-                             f"+{ADDITIONAL_EPOCHS} epochs while waiting...")
-                retrain()
-
-            first_cycle = False
-
+            run_pipeline()
         except KeyboardInterrupt:
             log.info("\nInterrupted by user. Exiting.")
             break

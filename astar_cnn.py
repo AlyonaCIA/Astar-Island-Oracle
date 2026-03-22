@@ -337,20 +337,19 @@ def make_model(arch="unet_cond", **kwargs):
 
 def collect_observations(round_id, seeds_count, initial_states, width, height):
     """
-    Two-phase viewport query strategy: guaranteed coverage + smart resampling.
+    Settlement-focused viewport query strategy: capture all settlements
+    with multiple observations for better distribution estimates.
 
-    Phase 1 — FULL COVERAGE (systematic grid, priority-ordered):
-        Use the systematic tile grid (e.g. 3×3 = 9 tiles for 40×40 maps)
-        to guarantee 100% map coverage on every seed.  Tiles are queried in
-        interest-priority order: most dynamic first, so if budget runs out
-        only the least informative (static) corners are missed.
-        After the first tile per seed, cross-seed intelligence is used to
-        re-rank remaining tiles.
+    Phase 1 — SETTLEMENT COVERAGE:
+        Place viewports via greedy set-cover to ensure every settlement and
+        port is observed on every seed. Viewports sorted by settlement
+        density, queried round-robin across seeds.
 
-    Phase 2 — SMART RESAMPLE (remaining budget):
-        Re-query the most dynamic observed viewports across all seeds.
-        Multiple observations per cell → better distribution estimates
-        (each query runs a fresh stochastic simulation).
+    Phase 2 — MULTI-OBSERVE (remaining budget):
+        Re-query the most dynamic/settlement-dense viewports across all seeds.
+        Each query is a fresh stochastic simulation, so multiple observations
+        build richer empirical frequency distributions — exactly what the
+        unet_cond model leverages.
     """
     budget = check_budget()
     if not budget:
@@ -365,12 +364,15 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
     queries_done = 0
     query_limit = remaining
 
-    # Build per-seed interest heatmaps from initial terrain
-    seed_interest = []
+    # Build settlement-focused viewports per seed
+    seed_viewports = []
     for s in range(seeds_count):
         grid = initial_states[s]["grid"]
-        interest = build_interest_heatmap(grid, width, height)
-        seed_interest.append(interest)
+        vps = compute_settlement_viewports(grid, width, height)
+        seed_viewports.append(vps)
+        n_settle = sum(1 for y in range(height) for x in range(width)
+                       if grid[y][x] in (1, 2))
+        print(f"  Seed {s}: {n_settle} settlements/ports → {len(vps)} viewports")
 
     def _do_query(seed, tx, ty, tw, th, phase_label):
         """Execute a single query and record the observation. Returns True if budget exhausted."""
@@ -396,148 +398,78 @@ def collect_observations(round_id, seeds_count, initial_states, width, height):
                 return True  # treat rate limit as budget stop
             raise
 
-    # ── Compute systematic tile grid for guaranteed 100% coverage ──
-    coverage_tiles = compute_tile_grid(width, height)
-    tiles_per_seed = len(coverage_tiles)
-    total_coverage_queries = tiles_per_seed * seeds_count
+    # Compute budget allocation
+    total_settlement_vps = sum(len(vps) for vps in seed_viewports)
+    max_vps_per_seed = max((len(vps) for vps in seed_viewports), default=0)
+    print(f"  Strategy: settlement-focused (capture all settlements → multi-observe)")
+    print(f"  Budget: {remaining} queries")
+    print(f"  Phase 1: SETTLEMENT COVERAGE ({total_settlement_vps} viewports "
+          f"across {seeds_count} seeds)")
 
-    # Score each tile per seed by interest (terrain dynamism)
-    seed_tile_order = []
-    for s in range(seeds_count):
-        scored = [
-            (score_tile(initial_states[s]["grid"], tile, width, height), i, tile)
-            for i, tile in enumerate(coverage_tiles)
-        ]
-        scored.sort(reverse=True)  # most interesting first
-        seed_tile_order.append([(tile, orig_idx) for _, orig_idx, tile in scored])
-
-    print(f"  Strategy: 2-phase (full coverage → smart resample), budget {remaining}")
-    print(f"  Phase 1: FULL COVERAGE ({tiles_per_seed} tiles/seed × {seeds_count} seeds "
-          f"= {total_coverage_queries} queries for 100% coverage)")
-
-    # ── Phase 1: FULL COVERAGE — systematic grid, priority-ordered ──
-    # Round-robin across seeds: query tile 0 (highest priority) on each seed,
-    # then tile 1, etc.  After the first tile per seed completes, use cross-seed
-    # intelligence to re-rank the remaining tiles.
-    seed_tile_idx = [0] * seeds_count  # next tile index per seed
-
-    # First tile per seed (scout pass — establishes cross-seed intelligence)
-    for s in range(seeds_count):
-        if queries_done >= query_limit or past_deadline():
-            break
-        tile, _ = seed_tile_order[s][0]
-        tx, ty, tw, th = tile
-        exhausted = _do_query(s, tx, ty, tw, th, "Cover 1 (scout)")
-        if exhausted:
-            _save_observations(observations, round_id)
-            return observations
-        seed_tile_idx[s] = 1
-
-    # Cross-seed intelligence: build dynamism heatmap from first-tile results
-    cross_seed_dynamism = np.zeros((height, width), dtype=np.float32)
-    for s in range(seeds_count):
-        grid = initial_states[s]["grid"]
-        dyn = build_observed_dynamism_heatmap(seed_obs[s], grid, width, height)
-        cross_seed_dynamism += dyn
-
-    # Re-rank remaining tiles per seed using boosted interest
-    if cross_seed_dynamism.sum() > 0:
-        for s in range(seeds_count):
-            remaining_tiles = seed_tile_order[s][seed_tile_idx[s]:]
-            if not remaining_tiles:
-                continue
-            boosted = seed_interest[s].copy()
-            boosted += 2.0 * cross_seed_dynamism / max(cross_seed_dynamism.max(), 1.0)
-            rescored = []
-            for tile, orig_idx in remaining_tiles:
-                tx, ty, tw, th = tile
-                tile_score = boosted[ty:ty+th, tx:tx+tw].sum()
-                rescored.append((tile_score, tile, orig_idx))
-            rescored.sort(reverse=True)
-            seed_tile_order[s][seed_tile_idx[s]:] = [
-                (tile, orig_idx) for _, tile, orig_idx in rescored
-            ]
-
-    # Continue coverage: round-robin remaining tiles across seeds
-    max_tile_idx = tiles_per_seed
-    for tile_round in range(1, max_tile_idx):
+    # ── Phase 1: SETTLEMENT COVERAGE ──
+    # Round-robin: query viewport 0 on all seeds, then viewport 1, etc.
+    for vp_idx in range(max_vps_per_seed):
         for s in range(seeds_count):
             if queries_done >= query_limit or past_deadline():
                 break
-            if seed_tile_idx[s] >= tiles_per_seed:
+            if vp_idx >= len(seed_viewports[s]):
                 continue
-            tile, _ = seed_tile_order[s][seed_tile_idx[s]]
-            tx, ty, tw, th = tile
-            exhausted = _do_query(s, tx, ty, tw, th, f"Cover {tile_round+1}")
+            tx, ty, tw, th = seed_viewports[s][vp_idx]
+            exhausted = _do_query(s, tx, ty, tw, th,
+                                  f"Settle {vp_idx+1}/{len(seed_viewports[s])}")
             if exhausted:
                 _save_observations(observations, round_id)
                 return observations
-            seed_tile_idx[s] += 1
         if queries_done >= query_limit or past_deadline():
             break
 
-    # Report coverage
+    # Report coverage after Phase 1
     for s in range(seeds_count):
         covered = np.zeros((height, width), dtype=bool)
         for obs in seed_obs[s]:
             vp = obs["viewport"]
             covered[vp["y"]:vp["y"]+vp["h"], vp["x"]:vp["x"]+vp["w"]] = True
         pct = covered.sum() / (width * height) * 100
-        print(f"  Seed {s}: {len(seed_obs[s])} queries, {pct:.0f}% coverage")
+        grid = initial_states[s]["grid"]
+        n_total = sum(1 for y in range(height) for x in range(width)
+                      if grid[y][x] in (1, 2))
+        n_covered = sum(1 for y in range(height) for x in range(width)
+                        if grid[y][x] in (1, 2) and covered[y, x])
+        print(f"  Seed {s}: {len(seed_obs[s])} queries, {pct:.0f}% map, "
+              f"settlements: {n_covered}/{n_total}")
 
-    # ── Update cross-seed dynamism after coverage phase ──
+    # ── Build cross-seed dynamism from Phase 1 observations ──
     cross_seed_dynamism = np.zeros((height, width), dtype=np.float32)
     for s in range(seeds_count):
         grid = initial_states[s]["grid"]
         dyn = build_observed_dynamism_heatmap(seed_obs[s], grid, width, height)
         cross_seed_dynamism += dyn
 
-    # ── Phase 2: SMART RESAMPLE — re-query most dynamic observed viewports ──
+    # ── Phase 2: MULTI-OBSERVE — re-query settlement viewports ──
     resample_budget = query_limit - queries_done
     if resample_budget > 0 and not past_deadline():
-        print(f"  Phase 2: SMART RESAMPLE ({resample_budget} queries on most dynamic viewports)")
+        print(f"  Phase 2: MULTI-OBSERVE ({resample_budget} queries on settlement viewports)")
 
-        # Rank all observed viewports by change rate
-        resample_candidates = []  # (change_rate, seed, viewport_xywh)
+        # Rank all settlement viewports by terrain score + observed dynamism
+        candidates = []
         for s in range(seeds_count):
-            grid = initial_states[s]["grid"]
-            for obs in seed_obs[s]:
-                rate = compute_obs_change_rate(obs, grid, width, height)
-                vp = obs["viewport"]
-                resample_candidates.append(
-                    (rate, s, (vp["x"], vp["y"], vp["w"], vp["h"]))
-                )
-        resample_candidates.sort(reverse=True)
+            for vp in seed_viewports[s]:
+                tx, ty, tw, th = vp
+                base_score = score_tile(initial_states[s]["grid"], vp, width, height)
+                dyn_bonus = cross_seed_dynamism[ty:ty+th, tx:tx+tw].sum()
+                combined = base_score + 2.0 * dyn_bonus
+                candidates.append((combined, s, vp))
+        candidates.sort(reverse=True)
 
-        # Also include cross-seed-informed viewports for under-sampled seeds
-        obs_counts = [len(seed_obs[s]) for s in range(seeds_count)]
-        min_obs = min(obs_counts) if obs_counts else 0
-        for s in range(seeds_count):
-            if obs_counts[s] <= min_obs and cross_seed_dynamism.sum() > 0:
-                extra_interest = cross_seed_dynamism.copy()
-                for obs in seed_obs[s]:
-                    vp = obs["viewport"]
-                    extra_interest[vp["y"]:vp["y"]+vp["h"], vp["x"]:vp["x"]+vp["w"]] *= 0.3
-                extra_vps = compute_greedy_viewports(
-                    extra_interest, width, height, n_viewports=1, min_spacing=3
-                )
-                if extra_vps:
-                    tx, ty, tw, th = extra_vps[0]
-                    rate = extra_interest[ty:ty+th, tx:tx+tw].sum() / (tw * th)
-                    resample_candidates.append((rate, s, (tx, ty, tw, th)))
-        resample_candidates.sort(reverse=True)
-
-        # Round-robin resample: cycle through top candidates
+        # Cycle through top candidates
         resample_idx = 0
         while queries_done < query_limit and not past_deadline():
-            if resample_idx >= len(resample_candidates):
-                resample_idx = 0  # cycle
-            if not resample_candidates:
+            if not candidates:
                 break
-            rate, s, (tx, ty, tw, th) = resample_candidates[resample_idx]
+            score, s, (tx, ty, tw, th) = candidates[resample_idx % len(candidates)]
             resample_idx += 1
             exhausted = _do_query(s, tx, ty, tw, th,
-                                  f"Resample (dyn={rate:.2f})")
+                                  f"Multi-obs {resample_idx} (score={score:.1f})")
             if exhausted:
                 break
 
@@ -559,6 +491,18 @@ def _save_observations(observations, round_id, round_number=None):
     with open(path, "w") as f:
         json.dump(payload, f)
     print(f"  Saved {len(observations)} observations to {path}")
+
+
+def _load_observations(round_id):
+    """Load previously saved observations for a round, if available."""
+    path = os.path.join(DATA_DIR, f"observations_{round_id[:8]}.json")
+    if not os.path.isfile(path):
+        return []
+    with open(path) as f:
+        raw = json.load(f)
+    if isinstance(raw, dict):
+        return raw.get("observations", [])
+    return raw
 
 
 def _save_round_data(round_id, detail):
@@ -595,6 +539,65 @@ def compute_tile_grid(width, height, max_tile=15):
     x_specs = axis_positions(width, max_tile)
     y_specs = axis_positions(height, max_tile)
     return [(tx, ty, tw, th) for (ty, th) in y_specs for (tx, tw) in x_specs]
+
+
+def compute_settlement_viewports(initial_grid, width, height, max_tile=15):
+    """
+    Greedy set-cover: place max_tile × max_tile viewports to capture ALL
+    settlements (1) and ports (2) on the initial grid.
+    Returns viewports sorted by settlement density (most settlements first),
+    so the most informative viewports are queried first if budget is limited.
+    Falls back to a single center viewport if no settlements exist.
+    """
+    settlements = []
+    for y in range(height):
+        for x in range(width):
+            if initial_grid[y][x] in (1, 2):
+                settlements.append((y, x))
+
+    tw = min(max_tile, width)
+    th = min(max_tile, height)
+
+    if not settlements:
+        cx = max(0, (width - tw) // 2)
+        cy = max(0, (height - th) // 2)
+        return [(cx, cy, tw, th)]
+
+    max_x = max(0, width - tw)
+    max_y = max(0, height - th)
+
+    uncovered = set(range(len(settlements)))
+    viewports = []
+
+    while uncovered:
+        best_vp = None
+        best_count = 0
+
+        for vy in range(max_y + 1):
+            for vx in range(max_x + 1):
+                count = sum(1 for i in uncovered
+                            if vy <= settlements[i][0] < vy + th
+                            and vx <= settlements[i][1] < vx + tw)
+                if count > best_count:
+                    best_count = count
+                    best_vp = (vx, vy, tw, th)
+
+        if best_vp is None or best_count == 0:
+            break
+
+        viewports.append(best_vp)
+        vx, vy, vw, vh = best_vp
+        uncovered = {i for i in uncovered
+                     if not (vy <= settlements[i][0] < vy + vh
+                             and vx <= settlements[i][1] < vx + vw)}
+
+    def _count_settlements(vp):
+        vx, vy, vw, vh = vp
+        return sum(1 for sy, sx in settlements
+                   if vy <= sy < vy + vh and vx <= sx < vx + vw)
+
+    viewports.sort(key=_count_settlements, reverse=True)
+    return viewports
 
 
 def score_tile(initial_grid, tile, width, height):
@@ -1132,11 +1135,15 @@ def main():
 
     # --- CNN pipeline (any error here is non-fatal — fallback already submitted) ---
     try:
-        # Step 4: Always collect observations (saved to disk for future training)
+        # Step 4: Collect observations (or load previously saved ones if budget spent)
         print(f"\n--- Collecting observations ({time_remaining():.0f}s remaining) ---")
         observations = collect_observations(
             round_id, seeds_count, initial_states, width, height
         )
+        if not observations:
+            observations = _load_observations(round_id)
+            if observations:
+                print(f"  Loaded {len(observations)} previously saved observations")
 
         if past_deadline():
             print("\nDeadline reached after observations. Fallback submission stands.")

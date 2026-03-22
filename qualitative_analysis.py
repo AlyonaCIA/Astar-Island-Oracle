@@ -99,7 +99,7 @@ def find_sample(gt_data, round_num, seed_idx):
 # Prediction generation: UNet Conditional
 # ---------------------------------------------------------------------------
 
-def predict_unet_cond(gt_sample, use_obs=True):
+def predict_unet_cond(gt_sample, use_obs=True, temperature=1.0):
     """
     Generate (H, W, 6) prediction tensor using UNet conditional model.
     Matches eval_cnn.py pipeline: model inference → bayesian_blend.
@@ -152,6 +152,10 @@ def predict_unet_cond(gt_sample, use_obs=True):
 
     with torch.no_grad():
         probs = model(x).squeeze(0)  # (6, H, W)
+        if temperature != 1.0:
+            logits = torch.log(torch.clamp(probs, min=1e-8))
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=0)
         pred = probs.permute(1, 2, 0).cpu().numpy()  # (H, W, 6)
 
     pred = np.maximum(pred, PROB_FLOOR)
@@ -263,6 +267,8 @@ def main():
                         help="Visualize all available GT samples")
     parser.add_argument("--no-obs", action="store_true",
                         help="Disable observation weighting")
+    parser.add_argument("--temperature", "-t", type=float, default=1.0,
+                        help="Softmax temperature (<1 = sharper, >1 = smoother)")
     parser.add_argument("--save-dir", type=str, default=None,
                         help="Save plots to this directory instead of showing")
     args = parser.parse_args()
@@ -277,7 +283,10 @@ def main():
     print(f"Loaded {len(gt_data)} ground truth samples")
 
     use_obs = not args.no_obs
+    temperature = args.temperature
     method_label = "UNet Cond"
+    if temperature != 1.0:
+        method_label += f" (T={temperature})"
 
     # Determine which samples to process
     if args.all:
@@ -309,7 +318,7 @@ def main():
 
         gt_tensor = np.array(gt_sample["ground_truth"], dtype=np.float32)
 
-        pred = predict_unet_cond(gt_sample, use_obs=use_obs)
+        pred = predict_unet_cond(gt_sample, use_obs=use_obs, temperature=temperature)
 
         score, wkl = compute_score(pred, gt_tensor)
         print(f"  Score: {score:.2f} | wKL: {wkl:.6f}")
