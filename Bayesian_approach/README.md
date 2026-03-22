@@ -155,20 +155,51 @@ python bayes_oracle.py crossval --hybrid-cnn
 
 ## Live Usage
 
-### Recommended: Dry-run first
+### Read This First
 
-This queries the active round, builds predictions, and writes them locally without submitting:
+`--no-submit` is not a dry run.
+
+If you run:
 
 ```bash
-python bayes_oracle.py live --hybrid-cnn --no-submit
+python bayes_oracle.py live --hybrid-cnn --allow-live-queries --no-submit
 ```
 
-This is the safest first command before spending the final submission.
+the script will still call `/simulate` and spend live query budget. It will only skip `/submit`.
+
+Use one of the safe modes below unless you explicitly want to spend budget.
+
+### Safe: True dry-run first
+
+This does not call `/simulate` and does not call `/submit`.
+
+It uses cached observations for the active round if they already exist locally. If no cached observations exist, it falls back to priors only and still writes prediction JSON files locally.
+
+```bash
+python bayes_oracle.py live --hybrid-cnn --dry-run
+```
+
+This is the safest first command before any live querying.
+
+### Safe: Reuse cached live observations only
+
+If someone already queried the active round and saved `observations_<roundid>.json` locally, this reuses that file and does not spend any additional query budget:
+
+```bash
+python bayes_oracle.py live --hybrid-cnn --reuse-only --no-submit
+```
+
+Important:
+
+- `--reuse-only` never calls `/simulate`
+- if there is no cached observations file for the active round, the model runs on priors only
 
 ### Submit to the active round
 
+This is the budget-spending path. It will call `/simulate` and then `/submit`:
+
 ```bash
-python bayes_oracle.py live --hybrid-cnn
+python bayes_oracle.py live --hybrid-cnn --allow-live-queries
 ```
 
 What this does:
@@ -180,18 +211,19 @@ What this does:
 5. Blends them with the local CNN prior.
 6. Submits predictions for all seeds.
 
-### Reuse cached observations instead of querying again
+### Query live but do not submit
 
-If the round’s observations were already collected and saved locally:
+Use this only if you intentionally want to spend live query budget but save the predictions locally instead of submitting:
 
 ```bash
-python bayes_oracle.py live --hybrid-cnn --reuse-only
+python bayes_oracle.py live --hybrid-cnn --allow-live-queries --no-submit
 ```
 
 Important:
 
-- `--reuse-only` is only useful if the corresponding `observations_<roundid>.json` file already exists locally.
-- If there are no cached observations for the active round, the model will have no live evidence to use.
+- this still spends `/simulate` budget
+- it only skips `/submit`
+- it writes `prediction_r<round>_s<seed>.json` files locally after the live queries finish
 
 ## Command Reference
 
@@ -200,8 +232,10 @@ Important:
 ```bash
 python bayes_oracle.py crossval
 python bayes_oracle.py round-eval 18 --exclude-round
-python bayes_oracle.py live --no-submit
-python bayes_oracle.py live
+python bayes_oracle.py live --dry-run
+python bayes_oracle.py live --reuse-only --no-submit
+python bayes_oracle.py live --allow-live-queries --no-submit
+python bayes_oracle.py live --allow-live-queries
 ```
 
 ### Hybrid CNN + Bayesian
@@ -209,19 +243,27 @@ python bayes_oracle.py live
 ```bash
 python bayes_oracle.py crossval --hybrid-cnn
 python bayes_oracle.py round-eval 18 --exclude-round --hybrid-cnn
-python bayes_oracle.py live --hybrid-cnn --no-submit
-python bayes_oracle.py live --hybrid-cnn
+python bayes_oracle.py live --hybrid-cnn --dry-run
+python bayes_oracle.py live --hybrid-cnn --reuse-only --no-submit
+python bayes_oracle.py live --hybrid-cnn --allow-live-queries --no-submit
+python bayes_oracle.py live --hybrid-cnn --allow-live-queries
 ```
 
 ## Practical Recommendation
 
-Use the hybrid mode:
+For the safest local validation path:
 
 ```bash
-python bayes_oracle.py live --hybrid-cnn
+python bayes_oracle.py live --hybrid-cnn --dry-run
 ```
 
-That is the strongest mode currently available in this workspace.
+For an intentional live query + submission run:
+
+```bash
+python bayes_oracle.py live --hybrid-cnn --allow-live-queries
+```
+
+That is the strongest mode currently available in this workspace, but it spends live query budget.
 
 ## What To Commit
 
@@ -250,7 +292,7 @@ Run these in order:
 python check_setup.py
 python bayes_oracle.py round-eval 16 --exclude-round --hybrid-cnn
 python bayes_oracle.py crossval --hybrid-cnn
-python bayes_oracle.py live --hybrid-cnn --no-submit
+python bayes_oracle.py live --hybrid-cnn --dry-run
 ```
 
 If all of those behave normally, the workspace is ready for another person to run locally.

@@ -932,6 +932,9 @@ def round_eval(args: argparse.Namespace) -> None:
 
 
 def live(args: argparse.Namespace) -> None:
+    if args.dry_run and args.allow_live_queries:
+        raise SystemExit("--dry-run and --allow-live-queries are mutually exclusive")
+
     samples = load_samples()
     oracle = EmpiricalBayesOracle(samples)
     oracle.fit()
@@ -939,11 +942,29 @@ def live(args: argparse.Namespace) -> None:
     session = make_session()
     active = get_active_round(session)
     round_detail = api_get(session, f"/rounds/{active['id']}")
-
-    observations = collect_live_observations(session, round_detail)
     round_id = round_detail["id"][:8]
-    if args.reuse_only and not observations:
-        observations = load_observations(round_id)
+    cached_observations = load_observations(round_id)
+
+    if args.dry_run:
+        observations = cached_observations
+        if observations:
+            print(f"dry-run: using {len(observations)} cached observations for round {round_id}")
+        else:
+            print(f"dry-run: no cached observations found for round {round_id}; using priors only")
+    elif args.reuse_only:
+        observations = cached_observations
+        if observations:
+            print(f"reuse-only: using {len(observations)} cached observations for round {round_id}")
+        else:
+            print(f"reuse-only: no cached observations found for round {round_id}; using priors only")
+    else:
+        if not args.allow_live_queries:
+            raise SystemExit(
+                "Refusing to spend live /simulate budget. "
+                "Use --dry-run for a safe local run, --reuse-only to use cached observations, "
+                "or add --allow-live-queries to query the active round intentionally."
+            )
+        observations = collect_live_observations(session, round_detail)
 
     obs_counts = observations_to_counts(observations)
     synthetic_samples = []
@@ -980,7 +1001,7 @@ def live(args: argparse.Namespace) -> None:
         else:
             predictions[sample.seed_index] = bayes_pred
 
-    if args.no_submit:
+    if args.no_submit or args.dry_run:
         for seed_index, pred in predictions.items():
             out = os.path.join(SCRIPT_DIR, f"prediction_r{round_detail['round_number']}_s{seed_index}.json")
             with open(out, "w") as f:
@@ -1008,9 +1029,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_round.add_argument("--cnn-checkpoint", default=None, help="Path to local CNN checkpoint for hybrid mode")
     p_round.set_defaults(func=round_eval)
 
-    p_live = sub.add_parser("live", help="Query active round and submit Bayesian predictions")
-    p_live.add_argument("--no-submit", action="store_true", help="Write predictions locally instead of submitting")
-    p_live.add_argument("--reuse-only", action="store_true", help="Reuse cached observations if budget is already spent")
+    p_live = sub.add_parser("live", help="Generate predictions for the active round")
+    p_live.add_argument(
+        "--allow-live-queries",
+        action="store_true",
+        help="Allow this command to call /simulate and spend live query budget",
+    )
+    p_live.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not call /simulate or /submit; use cached observations if available and save predictions locally",
+    )
+    p_live.add_argument(
+        "--no-submit",
+        action="store_true",
+        help="Write predictions locally instead of submitting; if combined with --allow-live-queries it still spends /simulate budget",
+    )
+    p_live.add_argument(
+        "--reuse-only",
+        action="store_true",
+        help="Do not call /simulate; reuse cached observations for the active round if present",
+    )
     p_live.add_argument("--hybrid-cnn", action="store_true", help="Blend Bayesian output with the refreshed CNN prior")
     p_live.add_argument("--cnn-checkpoint", default=None, help="Path to local CNN checkpoint for hybrid mode")
     p_live.set_defaults(func=live)
