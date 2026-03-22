@@ -266,6 +266,10 @@ def evaluate(ckpt_path, all_data, val_quadrant, use_viewports=False):
                 x = features  # (14, H, W)
             x = torch.tensor(x).unsqueeze(0).to(DEVICE)
             probs = model(x).squeeze(0)  # (6, H, W)
+            # Temperature scaling (sharpen predictions)
+            logits = torch.log(torch.clamp(probs, min=1e-8))
+            logits = logits / 0.85
+            probs = torch.softmax(logits, dim=0)
             cnn_pred = probs.permute(1, 2, 0).cpu().numpy()  # (H, W, 6)
         cnn_pred = np.maximum(cnn_pred, PROB_FLOOR)
         cnn_pred = cnn_pred / cnn_pred.sum(axis=-1, keepdims=True)
