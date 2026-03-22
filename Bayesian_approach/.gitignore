@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+predictions/
+submission_exports/
+*.log
+*.tmp
